@@ -320,3 +320,180 @@ def test_file_response_does_not_expose_sensitive_fields():
     assert "password" not in body
     assert "password_hash" not in body
     assert "owner_id" not in body
+
+
+def test_upload_file_content_creates_version_and_stores_content():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "upload-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+    content = b"Hello from Phase 4 storage!"
+
+    response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "upload-test.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+
+    body = response.json()
+
+    assert body["id"] == file_id
+    assert body["name"] == "upload-test.txt"
+    assert body["mime_type"] == "text/plain"
+    assert body["size_bytes"] == len(content)
+    assert body["current_version_id"] is not None
+
+
+def test_download_file_content_returns_uploaded_content():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "download-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+    content = b"Download this exact content."
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "download-test.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    download_response = client.get(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+    )
+
+    assert download_response.status_code == 200
+    assert download_response.content == content
+    assert download_response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert "attachment" in download_response.headers["content-disposition"]
+    assert "download-test.txt" in download_response.headers["content-disposition"]
+
+
+def test_upload_file_content_requires_authentication():
+    response = client.post(
+        "/api/v1/files/1/content",
+        files={
+            "upload": (
+                "unauthorized-upload.txt",
+                b"unauthorized",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_download_file_content_requires_authentication():
+    response = client.get("/api/v1/files/1/content")
+
+    assert response.status_code == 401
+
+
+def test_upload_file_content_rejects_another_users_file():
+    _, owner_token = create_user_and_login()
+    _, other_token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(owner_token),
+        json={
+            "name": "private-upload.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(other_token),
+        files={
+            "upload": (
+                "private-upload.txt",
+                b"secret",
+                "text/plain",
+            )
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "File not found."}
+
+
+def test_download_file_content_rejects_another_users_file():
+    _, owner_token = create_user_and_login()
+    _, other_token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(owner_token),
+        json={
+            "name": "private-download.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(owner_token),
+        files={
+            "upload": (
+                "private-download.txt",
+                b"private content",
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    response = client.get(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(other_token),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "File not found."}
