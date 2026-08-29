@@ -1,6 +1,8 @@
 from fastapi import FastAPI
-from app.core.config import settings
+
 from app.api.router import api_router
+from app.core.config import settings
+
 
 app = FastAPI(
     title=settings.app_name,
@@ -11,13 +13,16 @@ app = FastAPI(
 
 app.include_router(api_router, prefix="/api/v1")
 
+
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
+
 @app.get("/live", tags=["system"])
 def liveness() -> dict[str, str]:
     return {"status": "alive"}
+
 
 @app.get("/ready", tags=["system"])
 def readiness() -> dict[str, str]:

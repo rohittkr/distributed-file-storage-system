@@ -15,18 +15,22 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash_value: str) -> bool:
-    """Verify a plaintext password against its stored password hash."""
-    return password_hash.verify(password, password_hash_value)
+    """Verify a plaintext password against a stored password hash."""
+    try:
+        return password_hash.verify(password, password_hash_value)
+    except Exception:
+        return False
 
 
 def create_access_token(subject: str) -> str:
-    """Create a signed JWT access token."""
-    expires = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.access_token_minutes
-    )
+    """Create a signed JWT access token with an expiration timestamp."""
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=settings.access_token_minutes)
 
     payload = {
         "sub": subject,
+        "type": "access",
+        "iat": now,
         "exp": expires,
     }
 
@@ -38,7 +42,7 @@ def create_access_token(subject: str) -> str:
 
 
 def decode_access_token(token: str) -> str | None:
-    """Validate a JWT and return its subject, or None if invalid."""
+    """Validate a JWT access token and return its subject."""
     try:
         payload = jwt.decode(
             token,
@@ -46,12 +50,20 @@ def decode_access_token(token: str) -> str | None:
             algorithms=[settings.jwt_algorithm],
         )
 
+        if payload.get("type") != "access":
+            return None
+
         subject = payload.get("sub")
 
         if subject is None:
             return None
 
-        return str(subject)
+        subject = str(subject)
 
-    except JWTError:
+        if not subject.isdigit():
+            return None
+
+        return subject
+
+    except (JWTError, ValueError, TypeError):
         return None
