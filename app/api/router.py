@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_user
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
+from app.models.file import File
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -13,7 +14,11 @@ from app.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
-
+from app.schemas.files import (
+    FileCreateRequest,
+    FileResponse,
+    FileUpdateRequest,
+)
 
 api_router = APIRouter()
 
@@ -27,19 +32,15 @@ def version() -> dict[str, str]:
     "/auth/register",
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
-    tags=["authentication"],
+    tags=["auth"],
 )
 def register(
-    request: RegisterRequest,
+    payload: RegisterRequest,
     db: Session = Depends(get_db),
 ) -> User:
-    """Register a new user using an Argon2 password hash."""
-    email = request.email.lower()
+    email = payload.email.strip().lower()
 
-    existing_user = db.scalar(
-        select(User).where(User.email == email)
-    )
-
+    existing_user = db.scalar(select(User).where(User.email == email))
     if existing_user is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -48,7 +49,7 @@ def register(
 
     user = User(
         email=email,
-        password_hash=hash_password(request.password),
+        password_hash=hash_password(payload.password),
     )
 
     db.add(user)
@@ -63,30 +64,23 @@ def register(
         ) from None
 
     db.refresh(user)
-
     return user
 
 
 @api_router.post(
     "/auth/login",
     response_model=TokenResponse,
-    tags=["authentication"],
+    tags=["auth"],
 )
 def login(
-    request: LoginRequest,
+    payload: LoginRequest,
     db: Session = Depends(get_db),
 ) -> TokenResponse:
-    """Authenticate a user and return a JWT access token."""
-    email = request.email.lower()
+    email = payload.email.strip().lower()
 
-    user = db.scalar(
-        select(User).where(User.email == email)
-    )
+    user = db.scalar(select(User).where(User.email == email))
 
-    if user is None or not verify_password(
-        request.password,
-        user.password_hash,
-    ):
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -94,6 +88,13 @@ def login(
         )
 
     if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -108,10 +109,141 @@ def login(
 @api_router.get(
     "/auth/me",
     response_model=UserResponse,
-    tags=["authentication"],
+    tags=["auth"],
 )
 def get_me(
     current_user: User = Depends(get_current_user),
 ) -> User:
-    """Return the authenticated active user's public profile."""
     return current_user
+
+
+@api_router.post(
+    "/files",
+    response_model=FileResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["files"],
+)
+def create_file(
+    payload: FileCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> File:
+    file = File(
+        owner_id=current_user.id,
+        name=payload.name.strip(),
+        mime_type=payload.mime_type,
+        size_bytes=0,
+    )
+
+    db.add(file)
+    db.commit()
+    db.refresh(file)
+
+    return file
+
+
+@api_router.get(
+    "/files",
+    response_model=list[FileResponse],
+    tags=["files"],
+)
+def list_files(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[File]:
+    statement = (
+        select(File)
+        .where(File.owner_id == current_user.id)
+        .order_by(File.created_at.desc(), File.id.desc())
+    )
+
+    return list(db.scalars(statement).all())
+
+
+@api_router.get(
+    "/files/{file_id}",
+    response_model=FileResponse,
+    tags=["files"],
+)
+def get_file(
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> File:
+    statement = select(File).where(
+        File.id == file_id,
+        File.owner_id == current_user.id,
+    )
+
+    file = db.scalar(statement)
+
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    return file
+
+
+@api_router.patch(
+    "/files/{file_id}",
+    response_model=FileResponse,
+    tags=["files"],
+)
+def update_file(
+    file_id: int,
+    payload: FileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> File:
+    statement = select(File).where(
+        File.id == file_id,
+        File.owner_id == current_user.id,
+    )
+
+    file = db.scalar(statement)
+
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    if payload.name is not None:
+        file.name = payload.name.strip()
+
+    if payload.mime_type is not None:
+        file.mime_type = payload.mime_type
+
+    db.commit()
+    db.refresh(file)
+
+    return file
+
+
+@api_router.delete(
+    "/files/{file_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["files"],
+)
+def delete_file(
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    statement = select(File).where(
+        File.id == file_id,
+        File.owner_id == current_user.id,
+    )
+
+    file = db.scalar(statement)
+
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    db.delete(file)
+    db.commit()
