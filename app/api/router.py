@@ -30,6 +30,8 @@ from app.schemas.files import (
     FileResponse,
     FileUpdateRequest,
 )
+from app.storage.local import LocalStorageBackend
+
 
 api_router = APIRouter()
 
@@ -280,8 +282,10 @@ def upload_file_content(
     if len(data) > settings.max_upload_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds the maximum upload size of "
-            f"{settings.max_upload_bytes} bytes.",
+            detail=(
+                f"File exceeds the maximum upload size of "
+                f"{settings.max_upload_bytes} bytes."
+            ),
         )
 
     checksum = sha256(data).hexdigest()
@@ -304,16 +308,6 @@ def upload_file_content(
     db.add(version)
     db.flush()
 
-    chunk = Chunk(
-        version_id=version.id,
-        chunk_number=0,
-        size_bytes=len(data),
-        checksum=checksum,
-        content_hash=checksum,
-    )
-    db.add(chunk)
-    db.flush()
-
     storage_node = db.scalar(
         select(StorageNode).where(
             StorageNode.node_id == "local",
@@ -331,24 +325,41 @@ def upload_file_content(
         db.add(storage_node)
         db.flush()
 
-    storage_key = (
-        f"users/{current_user.id}/files/{file.id}/"
-        f"versions/{version_number}/chunks/0"
-    )
-
-    from app.storage.local import LocalStorageBackend
-
     storage = LocalStorageBackend(settings.local_storage_root)
-    storage.put(storage_key, data)
 
-    replica = ChunkReplica(
-        chunk_id=chunk.id,
-        storage_node_id=storage_node.id,
-        storage_key=storage_key,
-        status="healthy",
-        checksum=checksum,
-    )
-    db.add(replica)
+    chunk_size = settings.chunk_size_bytes
+
+    for chunk_number, offset in enumerate(
+        range(0, len(data), chunk_size)
+    ):
+        chunk_data = data[offset : offset + chunk_size]
+        chunk_checksum = sha256(chunk_data).hexdigest()
+
+        chunk = Chunk(
+            version_id=version.id,
+            chunk_number=chunk_number,
+            size_bytes=len(chunk_data),
+            checksum=chunk_checksum,
+            content_hash=chunk_checksum,
+        )
+        db.add(chunk)
+        db.flush()
+
+        storage_key = (
+            f"users/{current_user.id}/files/{file.id}/"
+            f"versions/{version_number}/chunks/{chunk_number}"
+        )
+
+        storage.put(storage_key, chunk_data)
+
+        replica = ChunkReplica(
+            chunk_id=chunk.id,
+            storage_node_id=storage_node.id,
+            storage_key=storage_key,
+            status="healthy",
+            checksum=chunk_checksum,
+        )
+        db.add(replica)
 
     file.size_bytes = len(data)
     file.current_version_id = version.id
@@ -388,33 +399,57 @@ def download_file_content(
             detail="File content not found.",
         )
 
-    replica = db.scalar(
-        select(ChunkReplica)
-        .join(Chunk, Chunk.id == ChunkReplica.chunk_id)
-        .where(
-            Chunk.version_id == file.current_version_id,
-            ChunkReplica.status == "healthy",
-        )
-        .order_by(ChunkReplica.id)
+    chunks = list(
+        db.scalars(
+            select(Chunk)
+            .where(Chunk.version_id == file.current_version_id)
+            .order_by(Chunk.chunk_number)
+        ).all()
     )
 
-    if replica is None:
+    if not chunks:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File content not found.",
         )
-
-    from app.storage.local import LocalStorageBackend
 
     storage = LocalStorageBackend(settings.local_storage_root)
 
-    try:
-        data = storage.get(replica.storage_key)
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File content not found.",
-        ) from None
+    content_parts: list[bytes] = []
+
+    for chunk in chunks:
+        replica = db.scalar(
+            select(ChunkReplica)
+            .where(
+                ChunkReplica.chunk_id == chunk.id,
+                ChunkReplica.status == "healthy",
+            )
+            .order_by(ChunkReplica.id)
+        )
+
+        if replica is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File content not found.",
+            )
+
+        try:
+            chunk_data = storage.get(replica.storage_key)
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File content not found.",
+            ) from None
+
+        if sha256(chunk_data).hexdigest() != chunk.checksum:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Stored file content failed integrity verification.",
+            )
+
+        content_parts.append(chunk_data)
+
+    data = b"".join(content_parts)
 
     return Response(
         content=data,

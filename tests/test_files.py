@@ -1,8 +1,12 @@
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from app.core.config import settings
+from app.db.session import SessionLocal
 from app.main import app
+from app.models.file import Chunk, ChunkReplica, FileVersion
 
 client = TestClient(app)
 
@@ -497,3 +501,139 @@ def test_download_file_content_rejects_another_users_file():
 
     assert response.status_code == 404
     assert response.json() == {"detail": "File not found."}
+
+
+def test_upload_file_content_splits_large_file_into_chunks():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "large-file.bin",
+            "mime_type": "application/octet-stream",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+    chunk_size = settings.chunk_size_bytes
+
+    content = (
+        b"A" * chunk_size
+        + b"B" * chunk_size
+        + b"C" * 123
+    )
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "large-file.bin",
+                content,
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    body = upload_response.json()
+
+    assert body["id"] == file_id
+    assert body["size_bytes"] == len(content)
+    assert body["current_version_id"] is not None
+
+    with SessionLocal() as db:
+        version = db.scalar(
+            select(FileVersion).where(
+                FileVersion.id == body["current_version_id"]
+            )
+        )
+
+        assert version is not None
+        assert version.size_bytes == len(content)
+
+        chunks = list(
+            db.scalars(
+                select(Chunk)
+                .where(Chunk.version_id == version.id)
+                .order_by(Chunk.chunk_number)
+            ).all()
+        )
+
+        replicas = list(
+            db.scalars(
+                select(ChunkReplica)
+                .join(Chunk, Chunk.id == ChunkReplica.chunk_id)
+                .where(Chunk.version_id == version.id)
+                .order_by(Chunk.chunk_number)
+            ).all()
+        )
+
+    assert len(chunks) == 3
+    assert len(replicas) == 3
+
+    assert chunks[0].chunk_number == 0
+    assert chunks[0].size_bytes == chunk_size
+
+    assert chunks[1].chunk_number == 1
+    assert chunks[1].size_bytes == chunk_size
+
+    assert chunks[2].chunk_number == 2
+    assert chunks[2].size_bytes == 123
+
+    assert all(chunk.checksum for chunk in chunks)
+    assert all(chunk.content_hash for chunk in chunks)
+
+    assert replicas[0].storage_key.endswith("/chunks/0")
+    assert replicas[1].storage_key.endswith("/chunks/1")
+    assert replicas[2].storage_key.endswith("/chunks/2")
+
+
+def test_download_file_content_reconstructs_large_file_from_chunks():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "reconstruct-large.bin",
+            "mime_type": "application/octet-stream",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    file_id = create_response.json()["id"]
+    chunk_size = settings.chunk_size_bytes
+
+    content = (
+        b"A" * chunk_size
+        + b"B" * chunk_size
+        + b"C" * 123
+    )
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "reconstruct-large.bin",
+                content,
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    download_response = client.get(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+    )
+
+    assert download_response.status_code == 200
+    assert download_response.content == content
