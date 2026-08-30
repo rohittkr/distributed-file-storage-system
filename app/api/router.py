@@ -36,6 +36,28 @@ from app.storage.local import LocalStorageBackend
 api_router = APIRouter()
 
 
+def get_healthy_storage_node(db: Session) -> StorageNode:
+    storage_node = db.scalar(
+        select(StorageNode)
+        .where(StorageNode.status == "healthy")
+        .order_by(StorageNode.used_bytes.asc(), StorageNode.id.asc())
+        .limit(1)
+    )
+
+    if storage_node is None:
+        storage_node = StorageNode(
+            node_id="local",
+            endpoint="local://storage",
+            status="healthy",
+            capacity_bytes=0,
+            used_bytes=0,
+        )
+        db.add(storage_node)
+        db.flush()
+
+    return storage_node
+
+
 @api_router.get("/version")
 def version() -> dict[str, str]:
     return {"version": "0.1.0", "status": "foundation"}
@@ -308,22 +330,7 @@ def upload_file_content(
     db.add(version)
     db.flush()
 
-    storage_node = db.scalar(
-        select(StorageNode).where(
-            StorageNode.node_id == "local",
-        )
-    )
-
-    if storage_node is None:
-        storage_node = StorageNode(
-            node_id="local",
-            endpoint="local://storage",
-            status="healthy",
-            capacity_bytes=0,
-            used_bytes=0,
-        )
-        db.add(storage_node)
-        db.flush()
+    storage_node = get_healthy_storage_node(db)
 
     storage = LocalStorageBackend(settings.local_storage_root)
 
