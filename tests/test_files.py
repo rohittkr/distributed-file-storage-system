@@ -665,3 +665,293 @@ def test_download_file_content_reconstructs_large_file_from_chunks():
 
     assert download_response.status_code == 200
     assert download_response.content == content
+
+def test_create_resumable_upload_session():
+    _, token = create_user_and_login()
+
+    response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "resumable.txt",
+            "total_size_bytes": 11,
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert response.status_code == 201
+
+    body = response.json()
+
+    assert body["filename"] == "resumable.txt"
+    assert body["mime_type"] == "text/plain"
+    assert body["total_size_bytes"] == 11
+    assert body["chunk_size_bytes"] == settings.chunk_size_bytes
+    assert body["total_chunks"] == 1
+    assert body["received_chunks"] == 0
+    assert body["status"] == "active"
+    assert body["file_id"] is not None
+    assert body["completed_at"] is None
+
+
+def test_get_resumable_upload_session():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "session-status.txt",
+            "total_size_bytes": 5,
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    session_id = create_response.json()["id"]
+
+    response = client.get(
+        f"/api/v1/uploads/{session_id}",
+        headers=auth_headers(token),
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["id"] == session_id
+    assert body["filename"] == "session-status.txt"
+    assert body["total_size_bytes"] == 5
+    assert body["received_chunks"] == 0
+    assert body["status"] == "active"
+
+
+def test_resumable_upload_single_chunk_and_complete():
+    _, token = create_user_and_login()
+
+    content = b"Hello World!"
+
+    create_response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "resumable-complete.txt",
+            "total_size_bytes": len(content),
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    session = create_response.json()
+    session_id = session["id"]
+
+    upload_response = client.post(
+        f"/api/v1/uploads/{session_id}/chunks/0",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "resumable-complete.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    chunk_body = upload_response.json()
+
+    assert chunk_body["session_id"] == session_id
+    assert chunk_body["chunk_number"] == 0
+    assert chunk_body["size_bytes"] == len(content)
+    assert chunk_body["received_chunks"] == 1
+    assert chunk_body["total_chunks"] == 1
+    assert chunk_body["status"] == "active"
+
+    complete_response = client.post(
+        f"/api/v1/uploads/{session_id}/complete",
+        headers=auth_headers(token),
+    )
+
+    assert complete_response.status_code == 200
+
+    body = complete_response.json()
+
+    assert body["file"]["name"] == "resumable-complete.txt"
+    assert body["file"]["size_bytes"] == len(content)
+    assert body["file"]["current_version_id"] is not None
+
+    assert body["session"]["id"] == session_id
+    assert body["session"]["status"] == "completed"
+    assert body["session"]["received_chunks"] == 1
+    assert body["session"]["completed_at"] is not None
+
+
+def test_resumable_upload_downloads_reconstructed_content():
+    _, token = create_user_and_login()
+
+    chunk_size = settings.chunk_size_bytes
+
+    content = (
+        b"A" * chunk_size
+        + b"B" * chunk_size
+        + b"C" * 123
+    )
+
+    create_response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "resumable-large.bin",
+            "total_size_bytes": len(content),
+            "mime_type": "application/octet-stream",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    session = create_response.json()
+    session_id = session["id"]
+
+    chunks = [
+        content[:chunk_size],
+        content[chunk_size : chunk_size * 2],
+        content[chunk_size * 2 :],
+    ]
+
+    for chunk_number, chunk_data in enumerate(chunks):
+        response = client.post(
+            f"/api/v1/uploads/{session_id}/chunks/{chunk_number}",
+            headers=auth_headers(token),
+            files={
+                "upload": (
+                    "resumable-large.bin",
+                    chunk_data,
+                    "application/octet-stream",
+                )
+            },
+        )
+
+        assert response.status_code == 201
+
+        body = response.json()
+
+        assert body["chunk_number"] == chunk_number
+        assert body["size_bytes"] == len(chunk_data)
+        assert body["received_chunks"] == chunk_number + 1
+        assert body["total_chunks"] == 3
+
+    complete_response = client.post(
+        f"/api/v1/uploads/{session_id}/complete",
+        headers=auth_headers(token),
+    )
+
+    assert complete_response.status_code == 200
+
+    file_id = complete_response.json()["file"]["id"]
+
+    download_response = client.get(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+    )
+
+    assert download_response.status_code == 200
+    assert download_response.content == content
+
+
+def test_resumable_upload_rejects_duplicate_chunk():
+    _, token = create_user_and_login()
+
+    content = b"duplicate test"
+
+    create_response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "duplicate.txt",
+            "total_size_bytes": len(content),
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    session_id = create_response.json()["id"]
+
+    first_response = client.post(
+        f"/api/v1/uploads/{session_id}/chunks/0",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "duplicate.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert first_response.status_code == 201
+
+    duplicate_response = client.post(
+        f"/api/v1/uploads/{session_id}/chunks/0",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "duplicate.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert duplicate_response.status_code == 409
+    assert duplicate_response.json() == {
+        "detail": "Chunk has already been uploaded."
+    }
+
+
+def test_resumable_upload_rejects_incomplete_completion():
+    _, token = create_user_and_login()
+
+    chunk_size = settings.chunk_size_bytes
+    content = b"A" * (chunk_size + 10)
+
+    create_response = client.post(
+        "/api/v1/uploads",
+        headers=auth_headers(token),
+        json={
+            "filename": "incomplete.bin",
+            "total_size_bytes": len(content),
+            "mime_type": "application/octet-stream",
+        },
+    )
+
+    assert create_response.status_code == 201
+
+    session_id = create_response.json()["id"]
+
+    first_chunk = content[:chunk_size]
+
+    upload_response = client.post(
+        f"/api/v1/uploads/{session_id}/chunks/0",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "incomplete.bin",
+                first_chunk,
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    complete_response = client.post(
+        f"/api/v1/uploads/{session_id}/complete",
+        headers=auth_headers(token),
+    )
+
+    assert complete_response.status_code == 409
+    assert "Upload is incomplete" in complete_response.json()["detail"]

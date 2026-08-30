@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from math import ceil
 
 from fastapi import (
     APIRouter,
@@ -17,7 +19,14 @@ from app.api.dependencies import get_current_user
 from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
-from app.models.file import Chunk, ChunkReplica, File, FileVersion, StorageNode
+from app.models.file import (
+    Chunk,
+    ChunkReplica,
+    File,
+    FileVersion,
+    StorageNode,
+    UploadSession,
+)
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -26,9 +35,13 @@ from app.schemas.auth import (
     UserResponse,
 )
 from app.schemas.files import (
+    CompleteUploadResponse,
     FileCreateRequest,
     FileResponse,
     FileUpdateRequest,
+    UploadChunkResponse,
+    UploadSessionCreateRequest,
+    UploadSessionResponse,
 )
 from app.storage.local import LocalStorageBackend
 
@@ -76,6 +89,94 @@ def get_healthy_storage_node(db: Session) -> StorageNode:
     db.flush()
 
     return storage_node
+
+
+def serialize_upload_session(
+    upload_session: UploadSession,
+) -> UploadSessionResponse:
+    if upload_session.file_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Upload session is not associated with a file.",
+        )
+
+    return UploadSessionResponse(
+        id=upload_session.id,
+        file_id=upload_session.file_id,
+        filename=upload_session.filename,
+        mime_type=upload_session.mime_type,
+        total_size_bytes=upload_session.total_size_bytes,
+        chunk_size_bytes=upload_session.chunk_size_bytes,
+        total_chunks=upload_session.total_chunks,
+        received_chunks=upload_session.received_chunks,
+        status=upload_session.status,
+        created_at=upload_session.created_at,
+        expires_at=upload_session.expires_at,
+        completed_at=upload_session.completed_at,
+    )
+
+
+def get_upload_session_for_user(
+    session_id: int,
+    current_user: User,
+    db: Session,
+) -> UploadSession:
+    upload_session = db.scalar(
+        select(UploadSession).where(
+            UploadSession.id == session_id,
+            UploadSession.owner_id == current_user.id,
+        )
+    )
+
+    if upload_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Upload session not found.",
+        )
+
+    return upload_session
+
+
+def ensure_upload_session_active(
+    upload_session: UploadSession,
+    db: Session,
+) -> None:
+    if upload_session.status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload session is already completed.",
+        )
+
+    if upload_session.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload session is not active.",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if upload_session.expires_at <= now:
+        upload_session.status = "expired"
+        db.commit()
+
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Upload session has expired.",
+        )
+
+
+def validate_chunk_number(
+    chunk_number: int,
+    total_chunks: int,
+) -> None:
+    if chunk_number < 0 or chunk_number >= total_chunks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Chunk number must be between 0 and "
+                f"{total_chunks - 1}."
+            ),
+        )
 
 
 @api_router.get("/version")
@@ -417,7 +518,7 @@ def upload_file_content(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=(
-                    f"Not enough healthy storage nodes for the required "
+                    "Not enough healthy storage nodes for the required "
                     f"replication factor of {replication_factor}."
                 ),
             )
@@ -563,4 +664,511 @@ def download_file_content(
                 f'attachment; filename="{file.name}"'
             ),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resumable uploads
+# ---------------------------------------------------------------------------
+
+
+@api_router.post(
+    "/uploads",
+    response_model=UploadSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["uploads"],
+)
+def create_upload_session(
+    payload: UploadSessionCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadSessionResponse:
+    if payload.total_size_bytes > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"File exceeds the maximum upload size of "
+                f"{settings.max_upload_bytes} bytes."
+            ),
+        )
+
+    chunk_size = settings.chunk_size_bytes
+
+    if chunk_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Chunk size must be greater than zero.",
+        )
+
+    total_chunks = (
+        ceil(payload.total_size_bytes / chunk_size)
+        if payload.total_size_bytes > 0
+        else 0
+    )
+
+    file = File(
+        owner_id=current_user.id,
+        name=payload.filename.strip(),
+        mime_type=payload.mime_type,
+        size_bytes=0,
+        current_version_id=None,
+    )
+
+    db.add(file)
+    db.flush()
+
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+    upload_session = UploadSession(
+        owner_id=current_user.id,
+        file_id=file.id,
+        filename=payload.filename.strip(),
+        mime_type=payload.mime_type,
+        total_size_bytes=payload.total_size_bytes,
+        chunk_size_bytes=chunk_size,
+        total_chunks=total_chunks,
+        received_chunks=0,
+        status="active",
+        expires_at=expires_at,
+    )
+
+    db.add(upload_session)
+    db.commit()
+    db.refresh(upload_session)
+
+    return serialize_upload_session(upload_session)
+
+
+@api_router.get(
+    "/uploads/{session_id}",
+    response_model=UploadSessionResponse,
+    tags=["uploads"],
+)
+def get_upload_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadSessionResponse:
+    upload_session = get_upload_session_for_user(
+        session_id,
+        current_user,
+        db,
+    )
+
+    if (
+        upload_session.status == "active"
+        and upload_session.expires_at <= datetime.now(timezone.utc)
+    ):
+        upload_session.status = "expired"
+        db.commit()
+        db.refresh(upload_session)
+
+    return serialize_upload_session(upload_session)
+
+
+@api_router.post(
+    "/uploads/{session_id}/chunks/{chunk_number}",
+    response_model=UploadChunkResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["uploads"],
+)
+def upload_resumable_chunk(
+    session_id: int,
+    chunk_number: int,
+    upload: UploadFile = FastAPIFile(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UploadChunkResponse:
+    upload_session = get_upload_session_for_user(
+        session_id,
+        current_user,
+        db,
+    )
+
+    ensure_upload_session_active(
+        upload_session,
+        db,
+    )
+
+    validate_chunk_number(
+        chunk_number,
+        upload_session.total_chunks,
+    )
+
+    if upload_session.file_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Upload session is not associated with a file.",
+        )
+
+    file = db.get(
+        File,
+        upload_session.file_id,
+    )
+
+    if file is None or file.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    chunk_data = upload.file.read()
+
+    expected_size = upload_session.chunk_size_bytes
+
+    if chunk_number < upload_session.total_chunks - 1:
+        if len(chunk_data) != expected_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Chunk {chunk_number} must be exactly "
+                    f"{expected_size} bytes."
+                ),
+            )
+    else:
+        remaining_size = (
+            upload_session.total_size_bytes
+            - (
+                expected_size
+                * max(upload_session.total_chunks - 1, 0)
+            )
+        )
+
+        if len(chunk_data) != remaining_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Final chunk must be exactly "
+                    f"{remaining_size} bytes."
+                ),
+            )
+
+    existing_chunk = db.scalar(
+        select(Chunk)
+        .join(FileVersion, Chunk.version_id == FileVersion.id)
+        .where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number == -session_id,
+            Chunk.chunk_number == chunk_number,
+        )
+    )
+
+    if existing_chunk is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Chunk has already been uploaded.",
+        )
+
+    chunk_checksum = sha256(chunk_data).hexdigest()
+
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
+
+    replication_factor = settings.replication_factor
+
+    if replication_factor < 1:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Replication factor must be at least 1.",
+        )
+
+    storage_nodes = get_healthy_storage_nodes(
+        db,
+        limit=replication_factor,
+    )
+
+    if len(storage_nodes) < replication_factor:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Not enough healthy storage nodes for the required "
+                f"replication factor of {replication_factor}."
+            ),
+        )
+
+    # A temporary FileVersion is created for each resumable upload.
+    # Its final checksum and size are replaced during completion.
+    version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number == -session_id,
+        )
+    )
+
+    if version is None:
+        version = FileVersion(
+            file_id=file.id,
+            version_number=-session_id,
+            size_bytes=0,
+            checksum=sha256(b"").hexdigest(),
+        )
+        db.add(version)
+        db.flush()
+
+    chunk = Chunk(
+        version_id=version.id,
+        chunk_number=chunk_number,
+        size_bytes=len(chunk_data),
+        checksum=chunk_checksum,
+        content_hash=chunk_checksum,
+    )
+
+    db.add(chunk)
+    db.flush()
+
+    for replica_number, storage_node in enumerate(storage_nodes):
+        storage_key = (
+            f"users/{current_user.id}/files/{file.id}/"
+            f"uploads/{session_id}/"
+            f"chunks/{chunk_number}/"
+            f"replica-{replica_number}"
+        )
+
+        storage.put(
+            storage_key,
+            chunk_data,
+        )
+
+        replica = ChunkReplica(
+            chunk_id=chunk.id,
+            storage_node_id=storage_node.id,
+            storage_key=storage_key,
+            status="healthy",
+            checksum=chunk_checksum,
+        )
+
+        db.add(replica)
+
+        storage_node.used_bytes += len(chunk_data)
+
+    upload_session.received_chunks += 1
+
+    db.commit()
+
+    return UploadChunkResponse(
+        session_id=upload_session.id,
+        chunk_number=chunk_number,
+        size_bytes=len(chunk_data),
+        received_chunks=upload_session.received_chunks,
+        total_chunks=upload_session.total_chunks,
+        status=upload_session.status,
+    )
+
+
+@api_router.post(
+    "/uploads/{session_id}/complete",
+    response_model=CompleteUploadResponse,
+    tags=["uploads"],
+)
+def complete_upload(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CompleteUploadResponse:
+    upload_session = get_upload_session_for_user(
+        session_id,
+        current_user,
+        db,
+    )
+
+    ensure_upload_session_active(
+        upload_session,
+        db,
+    )
+
+    if upload_session.file_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Upload session is not associated with a file.",
+        )
+
+    if upload_session.received_chunks != upload_session.total_chunks:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Upload is incomplete. Received "
+                f"{upload_session.received_chunks} of "
+                f"{upload_session.total_chunks} chunks."
+            ),
+        )
+
+    file = db.get(
+        File,
+        upload_session.file_id,
+    )
+
+    if file is None or file.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    temporary_version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number == -session_id,
+        )
+    )
+
+    if temporary_version is None:
+        if upload_session.total_chunks == 0:
+            latest_version_number = db.scalar(
+                select(FileVersion.version_number)
+                .where(FileVersion.file_id == file.id)
+                .order_by(FileVersion.version_number.desc())
+                .limit(1)
+            )
+
+            version_number = (latest_version_number or 0) + 1
+
+            version = FileVersion(
+                file_id=file.id,
+                version_number=version_number,
+                size_bytes=0,
+                checksum=sha256(b"").hexdigest(),
+            )
+
+            db.add(version)
+            db.flush()
+
+            file.size_bytes = 0
+            file.current_version_id = version.id
+
+            upload_session.status = "completed"
+            upload_session.completed_at = datetime.now(timezone.utc)
+
+            db.commit()
+            db.refresh(file)
+            db.refresh(upload_session)
+
+            return CompleteUploadResponse(
+                file=file,
+                session=serialize_upload_session(upload_session),
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload chunks were not found.",
+        )
+
+    chunks = list(
+        db.scalars(
+            select(Chunk)
+            .where(Chunk.version_id == temporary_version.id)
+            .order_by(Chunk.chunk_number)
+        ).all()
+    )
+
+    if len(chunks) != upload_session.total_chunks:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload chunks are incomplete.",
+        )
+
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
+
+    content_parts: list[bytes] = []
+
+    for expected_number, chunk in enumerate(chunks):
+        if chunk.chunk_number != expected_number:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Upload chunks are incomplete or out of order.",
+            )
+
+        replicas = list(
+            db.scalars(
+                select(ChunkReplica)
+                .where(
+                    ChunkReplica.chunk_id == chunk.id,
+                    ChunkReplica.status == "healthy",
+                )
+                .order_by(ChunkReplica.id)
+            ).all()
+        )
+
+        if not replicas:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"No healthy replica exists for chunk "
+                    f"{chunk.chunk_number}."
+                ),
+            )
+
+        chunk_data: bytes | None = None
+
+        for replica in replicas:
+            try:
+                candidate_data = storage.get(
+                    replica.storage_key
+                )
+            except FileNotFoundError:
+                continue
+
+            if sha256(candidate_data).hexdigest() != chunk.checksum:
+                continue
+
+            chunk_data = candidate_data
+            break
+
+        if chunk_data is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Stored upload content failed "
+                    "integrity verification."
+                ),
+            )
+
+        content_parts.append(chunk_data)
+
+    data = b"".join(content_parts)
+
+    if len(data) != upload_session.total_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Uploaded content size does not match the expected "
+                f"size of {upload_session.total_size_bytes} bytes."
+            ),
+        )
+
+    checksum = sha256(data).hexdigest()
+
+    latest_version_number = db.scalar(
+        select(FileVersion.version_number)
+        .where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number >= 0,
+        )
+        .order_by(FileVersion.version_number.desc())
+        .limit(1)
+    )
+
+    final_version_number = (latest_version_number or 0) + 1
+
+    temporary_version.version_number = final_version_number
+    temporary_version.size_bytes = len(data)
+    temporary_version.checksum = checksum
+
+    file.name = upload_session.filename
+    file.mime_type = upload_session.mime_type
+    file.size_bytes = len(data)
+    file.current_version_id = temporary_version.id
+
+    upload_session.status = "completed"
+    upload_session.completed_at = datetime.now(timezone.utc)
+
+    db.commit()
+
+    db.refresh(file)
+    db.refresh(upload_session)
+
+    return CompleteUploadResponse(
+        file=file,
+        session=serialize_upload_session(upload_session),
     )

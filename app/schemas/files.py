@@ -23,3 +23,40 @@ class FileResponse(BaseModel):
     current_version_id: int | None
     created_at: datetime
     updated_at: datetime
+
+
+class UploadSessionCreateRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=512)
+    total_size_bytes: int = Field(ge=0)
+    mime_type: str | None = Field(default=None, max_length=255)
+
+
+class UploadSessionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    filename: str
+    mime_type: str | None
+    total_size_bytes: int
+    chunk_size_bytes: int
+    total_chunks: int
+    received_chunks: int
+    status: str
+    file_id: int | None
+    created_at: datetime
+    expires_at: datetime
+    completed_at: datetime | None
+
+
+class UploadChunkResponse(BaseModel):
+    session_id: int
+    chunk_number: int
+    size_bytes: int
+    received_chunks: int
+    total_chunks: int
+    status: str
+
+
+class CompleteUploadResponse(BaseModel):
+    file: FileResponse
+    session: UploadSessionResponse
