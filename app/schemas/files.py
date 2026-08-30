@@ -60,3 +60,28 @@ class UploadChunkResponse(BaseModel):
 class CompleteUploadResponse(BaseModel):
     file: FileResponse
     session: UploadSessionResponse
+
+
+class StorageNodeCreateRequest(BaseModel):
+    node_id: str = Field(min_length=1, max_length=128)
+    endpoint: str = Field(min_length=1, max_length=512)
+    capacity_bytes: int = Field(ge=0)
+
+
+class StorageNodeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    node_id: str
+    endpoint: str
+    status: str
+    capacity_bytes: int
+    used_bytes: int
+    last_heartbeat: datetime | None
+
+
+class StorageNodeHeartbeatResponse(BaseModel):
+    id: int
+    node_id: str
+    status: str
+    last_heartbeat: datetime
