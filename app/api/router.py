@@ -36,24 +36,44 @@ from app.storage.local import LocalStorageBackend
 api_router = APIRouter()
 
 
-def get_healthy_storage_node(db: Session) -> StorageNode:
-    storage_node = db.scalar(
+def get_healthy_storage_nodes(
+    db: Session,
+    limit: int | None = None,
+    exclude_node_ids: set[int] | None = None,
+) -> list[StorageNode]:
+    statement = (
         select(StorageNode)
         .where(StorageNode.status == "healthy")
         .order_by(StorageNode.used_bytes.asc(), StorageNode.id.asc())
-        .limit(1)
     )
 
-    if storage_node is None:
-        storage_node = StorageNode(
-            node_id="local",
-            endpoint="local://storage",
-            status="healthy",
-            capacity_bytes=0,
-            used_bytes=0,
+    if exclude_node_ids:
+        statement = statement.where(
+            ~StorageNode.id.in_(exclude_node_ids)
         )
-        db.add(storage_node)
-        db.flush()
+
+    if limit is not None:
+        statement = statement.limit(limit)
+
+    return list(db.scalars(statement).all())
+
+
+def get_healthy_storage_node(db: Session) -> StorageNode:
+    storage_nodes = get_healthy_storage_nodes(db, limit=1)
+
+    if storage_nodes:
+        return storage_nodes[0]
+
+    storage_node = StorageNode(
+        node_id="local",
+        endpoint="local://storage",
+        status="healthy",
+        capacity_bytes=0,
+        used_bytes=0,
+    )
+
+    db.add(storage_node)
+    db.flush()
 
     return storage_node
 
@@ -74,7 +94,10 @@ def register(
     db: Session = Depends(get_db),
 ) -> User:
     email = payload.email.strip().lower()
-    existing_user = db.scalar(select(User).where(User.email == email))
+
+    existing_user = db.scalar(
+        select(User).where(User.email == email)
+    )
 
     if existing_user is not None:
         raise HTTPException(
@@ -86,18 +109,21 @@ def register(
         email=email,
         password_hash=hash_password(payload.password),
     )
+
     db.add(user)
 
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists.",
         ) from None
 
     db.refresh(user)
+
     return user
 
 
@@ -111,7 +137,10 @@ def login(
     db: Session = Depends(get_db),
 ) -> TokenResponse:
     email = payload.email.strip().lower()
-    user = db.scalar(select(User).where(User.email == email))
+
+    user = db.scalar(
+        select(User).where(User.email == email)
+    )
 
     if user is None:
         raise HTTPException(
@@ -127,7 +156,10 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not verify_password(payload.password, user.password_hash):
+    if not verify_password(
+        payload.password,
+        user.password_hash,
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -167,9 +199,11 @@ def create_file(
         mime_type=payload.mime_type,
         size_bytes=0,
     )
+
     db.add(file)
     db.commit()
     db.refresh(file)
+
     return file
 
 
@@ -187,6 +221,7 @@ def list_files(
         .where(File.owner_id == current_user.id)
         .order_by(File.created_at.desc(), File.id.desc())
     )
+
     return list(db.scalars(statement).all())
 
 
@@ -204,6 +239,7 @@ def get_file(
         File.id == file_id,
         File.owner_id == current_user.id,
     )
+
     file = db.scalar(statement)
 
     if file is None:
@@ -230,6 +266,7 @@ def update_file(
         File.id == file_id,
         File.owner_id == current_user.id,
     )
+
     file = db.scalar(statement)
 
     if file is None:
@@ -246,6 +283,7 @@ def update_file(
 
     db.commit()
     db.refresh(file)
+
     return file
 
 
@@ -263,6 +301,7 @@ def delete_file(
         File.id == file_id,
         File.owner_id == current_user.id,
     )
+
     file = db.scalar(statement)
 
     if file is None:
@@ -291,6 +330,7 @@ def upload_file_content(
         File.id == file_id,
         File.owner_id == current_user.id,
     )
+
     file = db.scalar(statement)
 
     if file is None:
@@ -327,19 +367,34 @@ def upload_file_content(
         size_bytes=len(data),
         checksum=checksum,
     )
+
     db.add(version)
     db.flush()
 
-    storage_node = get_healthy_storage_node(db)
-
-    storage = LocalStorageBackend(settings.local_storage_root)
-
     chunk_size = settings.chunk_size_bytes
+    replication_factor = settings.replication_factor
+
+    if chunk_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Chunk size must be greater than zero.",
+        )
+
+    if replication_factor < 1:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Replication factor must be at least 1.",
+        )
+
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
 
     for chunk_number, offset in enumerate(
         range(0, len(data), chunk_size)
     ):
         chunk_data = data[offset : offset + chunk_size]
+
         chunk_checksum = sha256(chunk_data).hexdigest()
 
         chunk = Chunk(
@@ -349,29 +404,53 @@ def upload_file_content(
             checksum=chunk_checksum,
             content_hash=chunk_checksum,
         )
+
         db.add(chunk)
         db.flush()
 
-        storage_key = (
-            f"users/{current_user.id}/files/{file.id}/"
-            f"versions/{version_number}/chunks/{chunk_number}"
+        storage_nodes = get_healthy_storage_nodes(
+            db,
+            limit=replication_factor,
         )
 
-        storage.put(storage_key, chunk_data)
+        if len(storage_nodes) < replication_factor:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Not enough healthy storage nodes for the required "
+                    f"replication factor of {replication_factor}."
+                ),
+            )
 
-        replica = ChunkReplica(
-            chunk_id=chunk.id,
-            storage_node_id=storage_node.id,
-            storage_key=storage_key,
-            status="healthy",
-            checksum=chunk_checksum,
-        )
-        db.add(replica)
+        for replica_number, storage_node in enumerate(
+            storage_nodes
+        ):
+            storage_key = (
+                f"users/{current_user.id}/files/{file.id}/"
+                f"versions/{version_number}/"
+                f"chunks/{chunk_number}/"
+                f"replica-{replica_number}"
+            )
+
+            storage.put(
+                storage_key,
+                chunk_data,
+            )
+
+            replica = ChunkReplica(
+                chunk_id=chunk.id,
+                storage_node_id=storage_node.id,
+                storage_key=storage_key,
+                status="healthy",
+                checksum=chunk_checksum,
+            )
+
+            db.add(replica)
+
+            storage_node.used_bytes += len(chunk_data)
 
     file.size_bytes = len(data)
     file.current_version_id = version.id
-
-    storage_node.used_bytes += len(data)
 
     db.commit()
     db.refresh(file)
@@ -392,6 +471,7 @@ def download_file_content(
         File.id == file_id,
         File.owner_id == current_user.id,
     )
+
     file = db.scalar(statement)
 
     if file is None:
@@ -409,7 +489,9 @@ def download_file_content(
     chunks = list(
         db.scalars(
             select(Chunk)
-            .where(Chunk.version_id == file.current_version_id)
+            .where(
+                Chunk.version_id == file.current_version_id
+            )
             .order_by(Chunk.chunk_number)
         ).all()
     )
@@ -420,38 +502,53 @@ def download_file_content(
             detail="File content not found.",
         )
 
-    storage = LocalStorageBackend(settings.local_storage_root)
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
 
     content_parts: list[bytes] = []
 
     for chunk in chunks:
-        replica = db.scalar(
-            select(ChunkReplica)
-            .where(
-                ChunkReplica.chunk_id == chunk.id,
-                ChunkReplica.status == "healthy",
-            )
-            .order_by(ChunkReplica.id)
+        replicas = list(
+            db.scalars(
+                select(ChunkReplica)
+                .where(
+                    ChunkReplica.chunk_id == chunk.id,
+                    ChunkReplica.status == "healthy",
+                )
+                .order_by(ChunkReplica.id)
+            ).all()
         )
 
-        if replica is None:
+        if not replicas:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="File content not found.",
             )
 
-        try:
-            chunk_data = storage.get(replica.storage_key)
-        except FileNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File content not found.",
-            ) from None
+        chunk_data: bytes | None = None
 
-        if sha256(chunk_data).hexdigest() != chunk.checksum:
+        for replica in replicas:
+            try:
+                candidate_data = storage.get(
+                    replica.storage_key
+                )
+            except FileNotFoundError:
+                continue
+
+            if sha256(candidate_data).hexdigest() != chunk.checksum:
+                continue
+
+            chunk_data = candidate_data
+            break
+
+        if chunk_data is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Stored file content failed integrity verification.",
+                detail=(
+                    "Stored file content failed "
+                    "integrity verification."
+                ),
             )
 
         content_parts.append(chunk_data)
@@ -462,6 +559,8 @@ def download_file_content(
         content=data,
         media_type=file.mime_type or "application/octet-stream",
         headers={
-            "Content-Disposition": f'attachment; filename="{file.name}"',
+            "Content-Disposition": (
+                f'attachment; filename="{file.name}"'
+            ),
         },
     )

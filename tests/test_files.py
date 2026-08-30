@@ -115,7 +115,10 @@ def test_get_file_returns_owner_file():
     create_response = client.post(
         "/api/v1/files",
         headers=auth_headers(token),
-        json={"name": "report.pdf", "mime_type": "application/pdf"},
+        json={
+            "name": "report.pdf",
+            "mime_type": "application/pdf",
+        },
     )
     assert create_response.status_code == 201
 
@@ -519,6 +522,7 @@ def test_upload_file_content_splits_large_file_into_chunks():
 
     file_id = create_response.json()["id"]
     chunk_size = settings.chunk_size_bytes
+    replication_factor = settings.replication_factor
 
     content = (
         b"A" * chunk_size
@@ -567,30 +571,54 @@ def test_upload_file_content_splits_large_file_into_chunks():
         replicas = list(
             db.scalars(
                 select(ChunkReplica)
-                .join(Chunk, Chunk.id == ChunkReplica.chunk_id)
+                .join(
+                    Chunk,
+                    Chunk.id == ChunkReplica.chunk_id,
+                )
                 .where(Chunk.version_id == version.id)
-                .order_by(Chunk.chunk_number)
+                .order_by(
+                    Chunk.chunk_number,
+                    ChunkReplica.id,
+                )
             ).all()
         )
 
-    assert len(chunks) == 3
-    assert len(replicas) == 3
+        assert len(chunks) == 3
+        assert len(replicas) == 3 * replication_factor
 
-    assert chunks[0].chunk_number == 0
-    assert chunks[0].size_bytes == chunk_size
+        assert [chunk.chunk_number for chunk in chunks] == [0, 1, 2]
 
-    assert chunks[1].chunk_number == 1
-    assert chunks[1].size_bytes == chunk_size
+        assert [chunk.size_bytes for chunk in chunks] == [
+            chunk_size,
+            chunk_size,
+            123,
+        ]
 
-    assert chunks[2].chunk_number == 2
-    assert chunks[2].size_bytes == 123
+        for chunk in chunks:
+            chunk_replicas = [
+                replica
+                for replica in replicas
+                if replica.chunk_id == chunk.id
+            ]
 
-    assert all(chunk.checksum for chunk in chunks)
-    assert all(chunk.content_hash for chunk in chunks)
+            assert len(chunk_replicas) == replication_factor
 
-    assert replicas[0].storage_key.endswith("/chunks/0")
-    assert replicas[1].storage_key.endswith("/chunks/1")
-    assert replicas[2].storage_key.endswith("/chunks/2")
+            assert all(
+                replica.status == "healthy"
+                for replica in chunk_replicas
+            )
+
+            assert all(
+                replica.checksum == chunk.checksum
+                for replica in chunk_replicas
+            )
+
+            storage_keys = {
+                replica.storage_key
+                for replica in chunk_replicas
+            }
+
+            assert len(storage_keys) == replication_factor
 
 
 def test_download_file_content_reconstructs_large_file_from_chunks():
