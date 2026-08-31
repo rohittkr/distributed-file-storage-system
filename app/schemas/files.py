@@ -85,3 +85,16 @@ class StorageNodeHeartbeatResponse(BaseModel):
     node_id: str
     status: str
     last_heartbeat: datetime
+class FileVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    file_id: int
+    version_number: int
+    size_bytes: int
+    checksum: str
+    created_at: datetime
+
+
+class FileVersionListResponse(BaseModel):
+    versions: list[FileVersionResponse]

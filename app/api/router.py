@@ -40,6 +40,8 @@ from app.schemas.files import (
     FileCreateRequest,
     FileResponse,
     FileUpdateRequest,
+    FileVersionListResponse,
+    FileVersionResponse,
     StorageNodeCreateRequest,
     StorageNodeHeartbeatResponse,
     StorageNodeResponse,
@@ -1291,4 +1293,213 @@ def complete_upload(
         file=file,
         session=serialize_upload_session(upload_session),
 
+    )
+# ---------------------------------------------------------------------------
+# File versions
+# ---------------------------------------------------------------------------
+
+
+@api_router.get(
+    "/files/{file_id}/versions",
+    response_model=FileVersionListResponse,
+    tags=["versions"],
+)
+def list_file_versions(
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FileVersionListResponse:
+    file = db.scalar(
+        select(File).where(
+            File.id == file_id,
+            File.owner_id == current_user.id,
+        )
+    )
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    versions = list(
+        db.scalars(
+            select(FileVersion)
+            .where(
+                FileVersion.file_id == file.id,
+                FileVersion.version_number >= 0,
+            )
+            .order_by(FileVersion.version_number.asc())
+        ).all()
+    )
+
+    return FileVersionListResponse(
+        versions=[
+            FileVersionResponse.model_validate(version)
+            for version in versions
+        ]
+    )
+
+
+@api_router.get(
+    "/files/{file_id}/versions/{version_number}",
+    response_model=FileVersionResponse,
+    tags=["versions"],
+)
+def get_file_version(
+    file_id: int,
+    version_number: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FileVersionResponse:
+    file = db.scalar(
+        select(File).where(
+            File.id == file_id,
+            File.owner_id == current_user.id,
+        )
+    )
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number == version_number,
+        )
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File version not found.",
+        )
+
+    return FileVersionResponse.model_validate(version)
+
+
+@api_router.get(
+    "/files/{file_id}/versions/{version_number}/content",
+    tags=["versions"],
+)
+def download_file_version_content(
+    file_id: int,
+    version_number: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    file = db.scalar(
+        select(File).where(
+            File.id == file_id,
+            File.owner_id == current_user.id,
+        )
+    )
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.file_id == file.id,
+            FileVersion.version_number == version_number,
+        )
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File version not found.",
+        )
+
+    chunks = list(
+        db.scalars(
+            select(Chunk)
+            .where(Chunk.version_id == version.id)
+            .order_by(Chunk.chunk_number)
+        ).all()
+    )
+
+    if not chunks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File version content not found.",
+        )
+
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
+
+    content_parts: list[bytes] = []
+
+    for chunk in chunks:
+        replicas = list(
+            db.scalars(
+                select(ChunkReplica)
+                .where(
+                    ChunkReplica.chunk_id == chunk.id,
+                    ChunkReplica.status == "healthy",
+                )
+                .order_by(ChunkReplica.id)
+            ).all()
+        )
+
+        if not replicas:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No healthy replica exists for chunk "
+                    f"{chunk.chunk_number}."
+                ),
+            )
+
+        chunk_data: bytes | None = None
+
+        for replica in replicas:
+            try:
+                candidate_data = storage.get(
+                    replica.storage_key
+                )
+            except FileNotFoundError:
+                continue
+
+            if sha256(candidate_data).hexdigest() != chunk.checksum:
+                continue
+
+            chunk_data = candidate_data
+            break
+
+        if chunk_data is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Stored file version content failed "
+                    "integrity verification."
+                ),
+            )
+
+        content_parts.append(chunk_data)
+
+    data = b"".join(content_parts)
+
+    if len(data) != version.size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored file version size does not match metadata.",
+        )
+
+    if sha256(data).hexdigest() != version.checksum:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored file version failed integrity verification.",
+        )
+
+    return Response(
+        content=data,
+        media_type=file.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{file.name}"'
+            ),
+        },
     )
