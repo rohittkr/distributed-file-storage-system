@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from math import ceil
 
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -39,10 +40,14 @@ from app.schemas.files import (
     FileCreateRequest,
     FileResponse,
     FileUpdateRequest,
+    StorageNodeCreateRequest,
+    StorageNodeHeartbeatResponse,
+    StorageNodeResponse,
     UploadChunkResponse,
     UploadSessionCreateRequest,
     UploadSessionResponse,
 )
+
 from app.storage.local import LocalStorageBackend
 
 
@@ -183,6 +188,120 @@ def validate_chunk_number(
 def version() -> dict[str, str]:
     return {"version": "0.1.0", "status": "foundation"}
 
+@api_router.post(
+    "/storage/nodes",
+    response_model=StorageNodeResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["storage"],
+)
+def create_storage_node(
+    payload: StorageNodeCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StorageNode:
+    existing_node = db.scalar(
+        select(StorageNode).where(
+            StorageNode.node_id == payload.node_id
+        )
+    )
+
+    if existing_node is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A storage node with this node_id already exists.",
+        )
+
+    storage_node = StorageNode(
+        node_id=payload.node_id,
+        endpoint=payload.endpoint,
+        status="healthy",
+        capacity_bytes=payload.capacity_bytes,
+        used_bytes=0,
+        last_heartbeat=datetime.now(timezone.utc),
+    )
+
+    db.add(storage_node)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A storage node with this node_id already exists.",
+        ) from None
+
+    db.refresh(storage_node)
+    return storage_node
+
+
+@api_router.get(
+    "/storage/nodes",
+    response_model=list[StorageNodeResponse],
+    tags=["storage"],
+)
+def list_storage_nodes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[StorageNode]:
+    statement = select(StorageNode).order_by(StorageNode.id.asc())
+    return list(db.scalars(statement).all())
+
+
+@api_router.get(
+    "/storage/nodes/{node_id}",
+    response_model=StorageNodeResponse,
+    tags=["storage"],
+)
+def get_storage_node(
+    node_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StorageNode:
+    storage_node = db.scalar(
+        select(StorageNode).where(
+            StorageNode.node_id == node_id
+        )
+    )
+
+    if storage_node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage node not found.",
+        )
+
+    return storage_node
+
+
+@api_router.post(
+    "/storage/nodes/{node_id}/heartbeat",
+    response_model=StorageNodeHeartbeatResponse,
+    tags=["storage"],
+)
+def storage_node_heartbeat(
+    node_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StorageNode:
+    storage_node = db.scalar(
+        select(StorageNode).where(
+            StorageNode.node_id == node_id
+        )
+    )
+
+    if storage_node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage node not found.",
+        )
+
+    storage_node.status = "healthy"
+    storage_node.last_heartbeat = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(storage_node)
+
+    return storage_node
 
 @api_router.post(
     "/auth/register",
@@ -1171,4 +1290,5 @@ def complete_upload(
     return CompleteUploadResponse(
         file=file,
         session=serialize_upload_session(upload_session),
+
     )
