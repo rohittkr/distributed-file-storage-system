@@ -78,3 +78,40 @@ def test_invalidate_file_cache():
     cache.redis_client.delete.assert_called_once_with(
         "file:7:42"
     )
+from redis.exceptions import RedisError
+
+def test_get_cached_file_handles_redis_error():
+    cache.redis_client.get = MagicMock(
+        side_effect=RedisError("Redis unavailable")
+    )
+
+    result = cache.get_cached_file(42, 7)
+
+    assert result is None
+
+
+def test_cache_file_handles_redis_error():
+    cache.redis_client.set = MagicMock(
+        side_effect=RedisError("Redis unavailable")
+    )
+
+    result = cache.cache_file(
+        42,
+        7,
+        {
+            "id": 42,
+            "name": "test.txt",
+        },
+    )
+
+    assert result is False
+
+
+def test_invalidate_file_cache_handles_redis_error():
+    cache.redis_client.delete = MagicMock(
+        side_effect=RedisError("Redis unavailable")
+    )
+
+    result = cache.invalidate_file_cache(42, 7)
+
+    assert result == 0
