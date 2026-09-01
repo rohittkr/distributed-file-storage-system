@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from math import ceil
+import secrets
 
 
 from fastapi import (
@@ -28,6 +29,9 @@ from app.models.file import (
     StorageNode,
     UploadSession,
 )
+
+from app.models.share import Share
+
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -42,6 +46,9 @@ from app.schemas.files import (
     FileUpdateRequest,
     FileVersionListResponse,
     FileVersionResponse,
+    ShareCreateRequest,
+    ShareCreateResponse,
+    ShareResponse,
     StorageNodeCreateRequest,
     StorageNodeHeartbeatResponse,
     StorageNodeResponse,
@@ -1492,6 +1499,318 @@ def download_file_version_content(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Stored file version failed integrity verification.",
+        )
+
+    return Response(
+        content=data,
+        media_type=file.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{file.name}"'
+            ),
+        },
+    )
+# ---------------------------------------------------------------------------
+# Secure sharing
+# ---------------------------------------------------------------------------
+
+
+@api_router.post(
+    "/files/{file_id}/shares",
+    response_model=ShareCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["shares"],
+)
+def create_file_share(
+    file_id: int,
+    share_request: ShareCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ShareCreateResponse:
+    file = db.scalar(
+        select(File).where(
+            File.id == file_id,
+            File.owner_id == current_user.id,
+        )
+    )
+
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    if share_request.permission not in {"viewer", "editor"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported share permission.",
+        )
+
+    if (
+        share_request.expires_at is not None
+        and share_request.expires_at <= datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Share expiration must be in the future.",
+        )
+
+    token = secrets.token_urlsafe(32)
+    token_hash = sha256(token.encode("utf-8")).hexdigest()
+
+    share = Share(
+        file_id=file.id,
+        owner_id=current_user.id,
+        token_hash=token_hash,
+        permission=share_request.permission,
+        expires_at=share_request.expires_at,
+    )
+
+    db.add(share)
+    db.commit()
+    db.refresh(share)
+
+    return ShareCreateResponse(
+        share=ShareResponse.model_validate(share),
+        token=token,
+    )
+# ---------------------------------------------------------------------------
+# Public share access
+# ---------------------------------------------------------------------------
+
+
+@api_router.get(
+    "/shares/{token}",
+    response_model=ShareResponse,
+    tags=["shares"],
+)
+def get_shared_file(
+    token: str,
+    db: Session = Depends(get_db),
+) -> ShareResponse:
+    token_hash = sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+    share = db.scalar(
+        select(Share).where(
+            Share.token_hash == token_hash,
+        )
+    )
+
+    if share is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if share.revoked_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    if (
+        share.expires_at is not None
+        and share.expires_at <= now
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    return ShareResponse.model_validate(share)
+@api_router.delete(
+    "/files/{file_id}/shares/{share_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["shares"],
+)
+def revoke_file_share(
+    file_id: int,
+    share_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    share = db.scalar(
+        select(Share).where(
+            Share.id == share_id,
+            Share.file_id == file_id,
+            Share.owner_id == current_user.id,
+        )
+    )
+
+    if share is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    if share.revoked_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    share.revoked_at = datetime.now(timezone.utc)
+
+    db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+@api_router.get(
+    "/shares/{token}/content",
+    tags=["shares"],
+)
+def download_shared_file_content(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    token_hash = sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+    share = db.scalar(
+        select(Share).where(
+            Share.token_hash == token_hash,
+        )
+    )
+
+    if share is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    if share.revoked_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    if (
+        share.expires_at is not None
+        and share.expires_at <= now
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Share not found.",
+        )
+
+    file = db.scalar(
+        select(File).where(
+            File.id == share.file_id,
+        )
+    )
+
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found.",
+        )
+
+    if file.current_version_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File content not found.",
+        )
+
+    chunks = list(
+        db.scalars(
+            select(Chunk)
+            .where(
+                Chunk.version_id == file.current_version_id
+            )
+            .order_by(Chunk.chunk_number)
+        ).all()
+    )
+
+    if not chunks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File content not found.",
+        )
+
+    storage = LocalStorageBackend(
+        settings.local_storage_root
+    )
+
+    content_parts: list[bytes] = []
+
+    for chunk in chunks:
+        replicas = list(
+            db.scalars(
+                select(ChunkReplica)
+                .where(
+                    ChunkReplica.chunk_id == chunk.id,
+                    ChunkReplica.status == "healthy",
+                )
+                .order_by(ChunkReplica.id)
+            ).all()
+        )
+
+        if not replicas:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No healthy replica exists for chunk "
+                    f"{chunk.chunk_number}."
+                ),
+            )
+
+        chunk_data: bytes | None = None
+
+        for replica in replicas:
+            try:
+                candidate_data = storage.get(
+                    replica.storage_key
+                )
+            except FileNotFoundError:
+                continue
+
+            if sha256(candidate_data).hexdigest() != chunk.checksum:
+                continue
+
+            chunk_data = candidate_data
+            break
+
+        if chunk_data is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Stored shared file content failed "
+                    "integrity verification."
+                ),
+            )
+
+        content_parts.append(chunk_data)
+
+    data = b"".join(content_parts)
+
+    version = db.scalar(
+        select(FileVersion).where(
+            FileVersion.id == file.current_version_id,
+        )
+    )
+
+    if version is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File version not found.",
+        )
+
+    if len(data) != version.size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored shared file size does not match metadata.",
+        )
+
+    if sha256(data).hexdigest() != version.checksum:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored shared file failed integrity verification.",
         )
 
     return Response(

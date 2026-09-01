@@ -98,3 +98,23 @@ class FileVersionResponse(BaseModel):
 
 class FileVersionListResponse(BaseModel):
     versions: list[FileVersionResponse]
+class ShareCreateRequest(BaseModel):
+    permission: str = Field(default="viewer", min_length=1, max_length=32)
+    expires_at: datetime | None = None
+
+
+class ShareResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    file_id: int
+    owner_id: int
+    permission: str
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class ShareCreateResponse(BaseModel):
+    share: ShareResponse
+    token: str

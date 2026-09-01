@@ -1,3 +1,4 @@
+from hashlib import sha256
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,8 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.main import app
 from app.models.file import Chunk, ChunkReplica, FileVersion
+from app.models.share import Share
+from datetime import datetime, timedelta, timezone
 
 client = TestClient(app)
 
@@ -955,3 +958,494 @@ def test_resumable_upload_rejects_incomplete_completion():
 
     assert complete_response.status_code == 409
     assert "Upload is incomplete" in complete_response.json()["detail"]
+def test_create_file_share_returns_token_without_exposing_hash():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "share-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert response.status_code == 201
+
+    body = response.json()
+
+    assert "token" in body
+    assert isinstance(body["token"], str)
+    assert len(body["token"]) > 20
+
+    assert body["share"]["file_id"] == file_id
+    assert body["share"]["permission"] == "viewer"
+    assert "token_hash" not in body["share"]
+
+
+def test_create_file_share_rejects_invalid_permission():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "share-permission-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "admin",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unsupported share permission."
+
+
+def test_create_file_share_rejects_expired_time():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "share-expiry-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    expires_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)
+    ).isoformat()
+
+    response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+            "expires_at": expires_at,
+        },
+    )
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"]
+        == "Share expiration must be in the future."
+    )
+def test_share_token_is_hashed_in_database():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "share-hash-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={"permission": "viewer"},
+    )
+
+    assert share_response.status_code == 201
+
+    body = share_response.json()
+    raw_token = body["token"]
+
+    with SessionLocal() as db:
+        share = db.scalar(
+            select(Share).where(
+                Share.id == body["share"]["id"]
+            )
+        )
+
+        assert share is not None
+
+        expected_hash = sha256(
+            raw_token.encode("utf-8")
+        ).hexdigest()
+
+        assert share.token_hash == expected_hash
+        assert share.token_hash != raw_token
+def test_get_shared_file_with_valid_token():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "public-share-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert share_response.status_code == 201
+    share_body = share_response.json()
+
+    raw_token = share_body["token"]
+
+    response = client.get(
+        f"/api/v1/shares/{raw_token}",
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["id"] == share_body["share"]["id"]
+    assert body["file_id"] == file_id
+    assert body["permission"] == "viewer"
+    assert "token_hash" not in body
+
+
+def test_get_shared_file_rejects_invalid_token():
+    response = client.get(
+        "/api/v1/shares/definitely-invalid-token",
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Share not found."
+
+
+def test_get_shared_file_rejects_expired_share():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "expired-share-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=1)
+    ).isoformat()
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+            "expires_at": expires_at,
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    raw_token = share_response.json()["token"]
+
+    import time
+
+    time.sleep(2)
+
+    response = client.get(
+        f"/api/v1/shares/{raw_token}",
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Share not found."
+def test_revoke_file_share_invalidates_token():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "revoke-share-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    share_body = share_response.json()
+    share_id = share_body["share"]["id"]
+    raw_token = share_body["token"]
+
+    before_revoke = client.get(
+        f"/api/v1/shares/{raw_token}",
+    )
+
+    assert before_revoke.status_code == 200
+
+    revoke_response = client.delete(
+        f"/api/v1/files/{file_id}/shares/{share_id}",
+        headers=auth_headers(token),
+    )
+
+    assert revoke_response.status_code == 204
+
+    after_revoke = client.get(
+        f"/api/v1/shares/{raw_token}",
+    )
+
+    assert after_revoke.status_code == 404
+    assert after_revoke.json()["detail"] == "Share not found."
+
+
+def test_non_owner_cannot_revoke_file_share():
+    _, owner_token = create_user_and_login()
+    _, other_token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(owner_token),
+        json={
+            "name": "revoke-owner-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(owner_token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    share_id = share_response.json()["share"]["id"]
+
+    revoke_response = client.delete(
+        f"/api/v1/files/{file_id}/shares/{share_id}",
+        headers=auth_headers(other_token),
+    )
+
+    assert revoke_response.status_code == 404
+    assert revoke_response.json()["detail"] == "Share not found."
+def test_download_shared_file_content_returns_uploaded_content():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "shared-content-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    content = b"This content is shared securely."
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "shared-content-test.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    raw_token = share_response.json()["token"]
+
+    download_response = client.get(
+        f"/api/v1/shares/{raw_token}/content",
+    )
+
+    assert download_response.status_code == 200
+    assert download_response.content == content
+    assert (
+        download_response.headers["content-type"]
+        == "text/plain; charset=utf-8"
+    )
+    assert (
+        download_response.headers["content-disposition"]
+        == 'attachment; filename="shared-content-test.txt"'
+    )
+
+
+def test_download_shared_file_content_rejects_revoked_share():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "revoked-content-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    content = b"This should no longer be accessible."
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "revoked-content-test.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    share_body = share_response.json()
+    raw_token = share_body["token"]
+    share_id = share_body["share"]["id"]
+
+    revoke_response = client.delete(
+        f"/api/v1/files/{file_id}/shares/{share_id}",
+        headers=auth_headers(token),
+    )
+
+    assert revoke_response.status_code == 204
+
+    download_response = client.get(
+        f"/api/v1/shares/{raw_token}/content",
+    )
+
+    assert download_response.status_code == 404
+    assert download_response.json()["detail"] == "Share not found."
+def test_download_shared_file_content_rejects_expired_share():
+    _, token = create_user_and_login()
+
+    create_response = client.post(
+        "/api/v1/files",
+        headers=auth_headers(token),
+        json={
+            "name": "expired-content-test.txt",
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert create_response.status_code == 201
+    file_id = create_response.json()["id"]
+
+    content = b"This content should expire."
+
+    upload_response = client.post(
+        f"/api/v1/files/{file_id}/content",
+        headers=auth_headers(token),
+        files={
+            "upload": (
+                "expired-content-test.txt",
+                content,
+                "text/plain",
+            )
+        },
+    )
+
+    assert upload_response.status_code == 201
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=1)
+    ).isoformat()
+
+    share_response = client.post(
+        f"/api/v1/files/{file_id}/shares",
+        headers=auth_headers(token),
+        json={
+            "permission": "viewer",
+            "expires_at": expires_at,
+        },
+    )
+
+    assert share_response.status_code == 201
+
+    raw_token = share_response.json()["token"]
+
+    import time
+
+    time.sleep(2)
+
+    download_response = client.get(
+        f"/api/v1/shares/{raw_token}/content",
+    )
+
+    assert download_response.status_code == 404
+    assert download_response.json()["detail"] == "Share not found."
