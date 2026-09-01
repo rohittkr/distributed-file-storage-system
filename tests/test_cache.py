@@ -1,4 +1,6 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from redis.exceptions import RedisError
 
 from app.core import cache
 
@@ -8,110 +10,111 @@ def test_file_cache_key():
 
 
 def test_get_cached_file():
-    cache.redis_client.get = MagicMock(
+    with patch.object(
+        cache.redis_client,
+        "get",
         return_value={
             "id": 42,
             "name": "test.txt",
+        },
+    ) as mock_get:
+        result = cache.get_cached_file(42, 7)
+
+        assert result == {
+            "id": 42,
+            "name": "test.txt",
         }
-    )
 
-    result = cache.get_cached_file(42, 7)
-
-    assert result == {
-        "id": 42,
-        "name": "test.txt",
-    }
-
-    cache.redis_client.get.assert_called_once_with(
-        "file:7:42"
-    )
+        mock_get.assert_called_once_with("file:7:42")
 
 
 def test_get_cached_file_returns_none_on_cache_miss():
-    cache.redis_client.get = MagicMock(
-        return_value=None
-    )
+    with patch.object(
+        cache.redis_client,
+        "get",
+        return_value=None,
+    ) as mock_get:
+        result = cache.get_cached_file(42, 7)
 
-    result = cache.get_cached_file(42, 7)
+        assert result is None
 
-    assert result is None
-
-    cache.redis_client.get.assert_called_once_with(
-        "file:7:42"
-    )
+        mock_get.assert_called_once_with("file:7:42")
 
 
 def test_cache_file():
-    cache.redis_client.set = MagicMock(
-        return_value=True
-    )
-
     value = {
         "id": 42,
         "name": "test.txt",
     }
 
-    result = cache.cache_file(
-        42,
-        7,
-        value,
-    )
+    with patch.object(
+        cache.redis_client,
+        "set",
+        return_value=True,
+    ) as mock_set:
+        result = cache.cache_file(
+            42,
+            7,
+            value,
+        )
 
-    assert result is True
+        assert result is True
 
-    cache.redis_client.set.assert_called_once_with(
-        "file:7:42",
-        value,
-        ttl_seconds=300,
-    )
+        mock_set.assert_called_once_with(
+            "file:7:42",
+            value,
+            ttl_seconds=300,
+        )
 
 
 def test_invalidate_file_cache():
-    cache.redis_client.delete = MagicMock(
-        return_value=1
-    )
+    with patch.object(
+        cache.redis_client,
+        "delete",
+        return_value=1,
+    ) as mock_delete:
+        result = cache.invalidate_file_cache(42, 7)
 
-    result = cache.invalidate_file_cache(42, 7)
+        assert result == 1
 
-    assert result == 1
+        mock_delete.assert_called_once_with("file:7:42")
 
-    cache.redis_client.delete.assert_called_once_with(
-        "file:7:42"
-    )
-from redis.exceptions import RedisError
 
 def test_get_cached_file_handles_redis_error():
-    cache.redis_client.get = MagicMock(
-        side_effect=RedisError("Redis unavailable")
-    )
+    with patch.object(
+        cache.redis_client,
+        "get",
+        side_effect=RedisError("Redis unavailable"),
+    ):
+        result = cache.get_cached_file(42, 7)
 
-    result = cache.get_cached_file(42, 7)
-
-    assert result is None
+        assert result is None
 
 
 def test_cache_file_handles_redis_error():
-    cache.redis_client.set = MagicMock(
-        side_effect=RedisError("Redis unavailable")
-    )
+    with patch.object(
+        cache.redis_client,
+        "set",
+        side_effect=RedisError("Redis unavailable"),
+    ):
+        result = cache.cache_file(
+            42,
+            7,
+            {
+                "id": 42,
+                "name": "test.txt",
+            },
+        )
 
-    result = cache.cache_file(
-        42,
-        7,
-        {
-            "id": 42,
-            "name": "test.txt",
-        },
-    )
-
-    assert result is False
+        assert result is False
 
 
 def test_invalidate_file_cache_handles_redis_error():
-    cache.redis_client.delete = MagicMock(
-        side_effect=RedisError("Redis unavailable")
-    )
+    with patch.object(
+        cache.redis_client,
+        "delete",
+        side_effect=RedisError("Redis unavailable"),
+    ):
+        result = cache.invalidate_file_cache(42, 7)
 
-    result = cache.invalidate_file_cache(42, 7)
-
-    assert result == 0
+        assert result == 0

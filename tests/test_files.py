@@ -729,6 +729,147 @@ def test_get_resumable_upload_session():
     assert body["received_chunks"] == 0
     assert body["status"] == "active"
 
+def test_create_resumable_upload_with_same_idempotency_key_returns_same_session():
+    _, token = create_user_and_login()
+
+    headers = {
+        **auth_headers(token),
+        "Idempotency-Key": "upload-test-123",
+    }
+
+    payload = {
+        "filename": "idempotent.txt",
+        "total_size_bytes": 11,
+        "mime_type": "text/plain",
+    }
+
+    first_response = client.post(
+        "/api/v1/uploads",
+        headers=headers,
+        json=payload,
+    )
+
+    assert first_response.status_code == 201
+
+    first_body = first_response.json()
+
+    second_response = client.post(
+        "/api/v1/uploads",
+        headers=headers,
+        json=payload,
+    )
+
+    assert second_response.status_code == 201
+
+    second_body = second_response.json()
+
+    assert second_body["id"] == first_body["id"]
+    assert second_body["file_id"] == first_body["file_id"]
+
+
+def test_create_resumable_upload_with_different_idempotency_keys_creates_different_sessions():
+    _, token = create_user_and_login()
+
+    payload = {
+        "filename": "different-keys.txt",
+        "total_size_bytes": 11,
+        "mime_type": "text/plain",
+    }
+
+    first_response = client.post(
+        "/api/v1/uploads",
+        headers={
+            **auth_headers(token),
+            "Idempotency-Key": "upload-key-1",
+        },
+        json=payload,
+    )
+
+    second_response = client.post(
+        "/api/v1/uploads",
+        headers={
+            **auth_headers(token),
+            "Idempotency-Key": "upload-key-2",
+        },
+        json=payload,
+    )
+
+    assert first_response.status_code == 201
+    assert second_response.status_code == 201
+
+    assert (
+        first_response.json()["id"]
+        != second_response.json()["id"]
+    )
+
+    assert (
+        first_response.json()["file_id"]
+        != second_response.json()["file_id"]
+    )
+
+
+def test_create_resumable_upload_same_idempotency_key_is_scoped_to_user():
+    _, owner_token = create_user_and_login()
+    _, other_token = create_user_and_login()
+
+    payload = {
+        "filename": "user-scoped.txt",
+        "total_size_bytes": 11,
+        "mime_type": "text/plain",
+    }
+
+    owner_response = client.post(
+        "/api/v1/uploads",
+        headers={
+            **auth_headers(owner_token),
+            "Idempotency-Key": "same-key",
+        },
+        json=payload,
+    )
+
+    other_response = client.post(
+        "/api/v1/uploads",
+        headers={
+            **auth_headers(other_token),
+            "Idempotency-Key": "same-key",
+        },
+        json=payload,
+    )
+
+    assert owner_response.status_code == 201
+    assert other_response.status_code == 201
+
+    assert (
+        owner_response.json()["id"]
+        != other_response.json()["id"]
+    )
+
+    assert (
+        owner_response.json()["file_id"]
+        != other_response.json()["file_id"]
+    )
+
+
+def test_create_resumable_upload_rejects_empty_idempotency_key():
+    _, token = create_user_and_login()
+
+    response = client.post(
+        "/api/v1/uploads",
+        headers={
+            **auth_headers(token),
+            "Idempotency-Key": "   ",
+        },
+        json={
+            "filename": "empty-key.txt",
+            "total_size_bytes": 11,
+            "mime_type": "text/plain",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Idempotency-Key must not be empty."
+    }
 
 def test_resumable_upload_single_chunk_and_complete():
     _, token = create_user_and_login()

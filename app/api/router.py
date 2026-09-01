@@ -8,6 +8,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File as FastAPIFile,
+    Header,
     HTTPException,
     Response,
     UploadFile,
@@ -24,6 +25,7 @@ from app.core.cache import (
     invalidate_file_cache,
 )
 from app.core.config import settings
+from app.core.redis import redis_client
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
 from app.models.file import (
@@ -839,6 +841,10 @@ def create_upload_session(
     payload: UploadSessionCreateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
 ) -> UploadSessionResponse:
     if payload.total_size_bytes > settings.max_upload_bytes:
         raise HTTPException(
@@ -862,6 +868,41 @@ def create_upload_session(
         if payload.total_size_bytes > 0
         else 0
     )
+
+    idempotency_cache_key = None
+
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+
+        if not idempotency_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Idempotency-Key must not be empty.",
+            )
+
+        idempotency_cache_key = (
+            f"upload:idempotency:{current_user.id}:{idempotency_key}"
+        )
+
+        existing_session_id = redis_client.get(
+            idempotency_cache_key
+        )
+
+        if existing_session_id is not None:
+            try:
+                existing_session = db.scalar(
+                    select(UploadSession).where(
+                        UploadSession.id == int(existing_session_id),
+                        UploadSession.owner_id == current_user.id,
+                    )
+                )
+            except (TypeError, ValueError):
+                existing_session = None
+
+            if existing_session is not None:
+                return serialize_upload_session(
+                    existing_session
+                )
 
     file = File(
         owner_id=current_user.id,
@@ -892,6 +933,13 @@ def create_upload_session(
     db.add(upload_session)
     db.commit()
     db.refresh(upload_session)
+
+    if idempotency_cache_key is not None:
+        redis_client.set(
+            idempotency_cache_key,
+            upload_session.id,
+            ttl_seconds=24 * 60 * 60,
+        )
 
     return serialize_upload_session(upload_session)
 
