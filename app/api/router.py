@@ -18,6 +18,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.core.cache import (
+    cache_file,
+    get_cached_file,
+    invalidate_file_cache,
+)
 from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.session import get_db
@@ -463,7 +468,15 @@ def get_file(
     file_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> File:
+) -> FileResponse:
+    cached_file = get_cached_file(
+        file_id,
+        current_user.id,
+    )
+
+    if cached_file is not None:
+        return FileResponse.model_validate(cached_file)
+
     statement = select(File).where(
         File.id == file_id,
         File.owner_id == current_user.id,
@@ -477,7 +490,15 @@ def get_file(
             detail="File not found.",
         )
 
-    return file
+    response = FileResponse.model_validate(file)
+
+    cache_file(
+        file.id,
+        current_user.id,
+        response.model_dump(mode="json"),
+    )
+
+    return response
 
 
 @api_router.patch(
@@ -513,8 +534,12 @@ def update_file(
     db.commit()
     db.refresh(file)
 
-    return file
+    invalidate_file_cache(
+        file.id,
+        current_user.id,
+    )
 
+    return file
 
 @api_router.delete(
     "/files/{file_id}",
@@ -542,6 +567,10 @@ def delete_file(
     db.delete(file)
     db.commit()
 
+    invalidate_file_cache(
+        file.id,
+        current_user.id,
+    )
 
 @api_router.post(
     "/files/{file_id}/content",
