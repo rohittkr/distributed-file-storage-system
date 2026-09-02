@@ -319,6 +319,80 @@ def storage_node_heartbeat(
 
     return storage_node
 
+
+@api_router.post(
+    "/storage/nodes/{node_id}/fail",
+    response_model=StorageNodeResponse,
+    tags=["storage"],
+)
+def fail_storage_node(
+    node_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StorageNode:
+    storage_node = db.scalar(
+        select(StorageNode).where(
+            StorageNode.node_id == node_id
+        )
+    )
+
+    if storage_node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage node not found.",
+        )
+
+    if storage_node.status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Storage node is already failed.",
+        )
+
+    storage_node.status = "failed"
+
+    db.commit()
+    db.refresh(storage_node)
+
+    return storage_node
+
+
+@api_router.post(
+    "/storage/nodes/{node_id}/recover",
+    response_model=StorageNodeResponse,
+    tags=["storage"],
+)
+def recover_storage_node(
+    node_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StorageNode:
+    storage_node = db.scalar(
+        select(StorageNode).where(
+            StorageNode.node_id == node_id
+        )
+    )
+
+    if storage_node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage node not found.",
+        )
+
+    if storage_node.status == "healthy":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Storage node is already healthy.",
+        )
+
+    storage_node.status = "healthy"
+    storage_node.last_heartbeat = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(storage_node)
+
+    return storage_node
+
+
 @api_router.post(
     "/auth/register",
     response_model=UserResponse,
