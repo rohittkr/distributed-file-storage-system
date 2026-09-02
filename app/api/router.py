@@ -646,10 +646,6 @@ def upload_file_content(
             detail="Replication factor must be at least 1.",
         )
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     for chunk_number, offset in enumerate(
         range(0, len(data), chunk_size)
     ):
@@ -690,6 +686,11 @@ def upload_file_content(
                 f"versions/{version_number}/"
                 f"chunks/{chunk_number}/"
                 f"replica-{replica_number}"
+            )
+
+            storage = LocalStorageBackend(
+                settings.local_storage_root,
+                node_id=storage_node.node_id,
             )
 
             storage.put(
@@ -762,10 +763,6 @@ def download_file_content(
             detail="File content not found.",
         )
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     content_parts: list[bytes] = []
 
     for chunk in chunks:
@@ -789,6 +786,19 @@ def download_file_content(
         chunk_data: bytes | None = None
 
         for replica in replicas:
+            storage_node = db.get(
+                StorageNode,
+                replica.storage_node_id,
+            )
+
+            if storage_node is None:
+                continue
+
+            storage = LocalStorageBackend(
+                settings.local_storage_root,
+                node_id=storage_node.node_id,
+            )
+
             try:
                 candidate_data = storage.get(
                     replica.storage_key
@@ -1118,10 +1128,6 @@ def upload_resumable_chunk(
 
     chunk_checksum = sha256(chunk_data).hexdigest()
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     replication_factor = settings.replication_factor
 
     if replication_factor < 1:
@@ -1181,6 +1187,10 @@ def upload_resumable_chunk(
             f"chunks/{chunk_number}/"
             f"replica-{replica_number}"
         )
+        storage = LocalStorageBackend(
+        settings.local_storage_root,
+        node_id=storage_node.node_id,
+    )
 
         storage.put(
             storage_key,
@@ -1323,10 +1333,6 @@ def complete_upload(
             detail="Upload chunks are incomplete.",
         )
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     content_parts: list[bytes] = []
 
     for expected_number, chunk in enumerate(chunks):
@@ -1359,6 +1365,19 @@ def complete_upload(
         chunk_data: bytes | None = None
 
         for replica in replicas:
+            storage_node = db.get(
+                StorageNode,
+                replica.storage_node_id,
+            )
+
+            if storage_node is None:
+                continue
+
+            storage = LocalStorageBackend(
+                settings.local_storage_root,
+                node_id=storage_node.node_id,
+            )
+
             try:
                 candidate_data = storage.get(
                     replica.storage_key
@@ -1562,10 +1581,6 @@ def download_file_version_content(
             detail="File version content not found.",
         )
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     content_parts: list[bytes] = []
 
     for chunk in chunks:
@@ -1592,6 +1607,19 @@ def download_file_version_content(
         chunk_data: bytes | None = None
 
         for replica in replicas:
+            storage_node = db.get(
+                StorageNode,
+                replica.storage_node_id,
+            )
+
+            if storage_node is None:
+                continue
+
+            storage = LocalStorageBackend(
+                settings.local_storage_root,
+                node_id=storage_node.node_id,
+            )
+
             try:
                 candidate_data = storage.get(
                     replica.storage_key
@@ -1862,10 +1890,6 @@ def download_shared_file_content(
             detail="File content not found.",
         )
 
-    storage = LocalStorageBackend(
-        settings.local_storage_root
-    )
-
     content_parts: list[bytes] = []
 
     for chunk in chunks:
@@ -1892,6 +1916,19 @@ def download_shared_file_content(
         chunk_data: bytes | None = None
 
         for replica in replicas:
+            storage_node = db.get(
+                StorageNode,
+                replica.storage_node_id,
+            )
+
+            if storage_node is None:
+                continue
+
+            storage = LocalStorageBackend(
+                settings.local_storage_root,
+                node_id=storage_node.node_id,
+            )
+
             try:
                 candidate_data = storage.get(
                     replica.storage_key
