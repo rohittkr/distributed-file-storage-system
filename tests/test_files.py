@@ -1,10 +1,14 @@
 from hashlib import sha256
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import settings
+from app.core.redis import redis_client
 from app.db.session import SessionLocal
 from app.main import app
 from app.models.file import Chunk, ChunkReplica, FileVersion
@@ -931,6 +935,61 @@ def test_resumable_upload_single_chunk_and_complete():
     assert body["session"]["status"] == "completed"
     assert body["session"]["received_chunks"] == 1
     assert body["session"]["completed_at"] is not None
+
+def test_create_resumable_upload_concurrent_same_idempotency_key(
+    monkeypatch,
+):
+    _, token = create_user_and_login()
+
+    payload = {
+        "filename": "concurrent-idempotent.txt",
+        "total_size_bytes": 11,
+        "mime_type": "text/plain",
+    }
+
+    headers = {
+        **auth_headers(token),
+        "Idempotency-Key": "concurrent-upload-test",
+    }
+
+    barrier = Barrier(2)
+    original_set_if_not_exists = redis_client.set_if_not_exists
+
+    def synchronized_set_if_not_exists(*args, **kwargs):
+        result = original_set_if_not_exists(*args, **kwargs)
+        barrier.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        redis_client,
+        "set_if_not_exists",
+        synchronized_set_if_not_exists,
+    )
+
+    def create_upload():
+        return client.post(
+            "/api/v1/uploads",
+            headers=headers,
+            json=payload,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(create_upload)
+            for _ in range(2)
+        ]
+
+        responses = [
+            future.result()
+            for future in futures
+        ]
+
+    status_codes = sorted(
+        response.status_code
+        for response in responses
+    )
+
+    assert status_codes == [201, 409]
 
 
 def test_resumable_upload_downloads_reconstructed_content():

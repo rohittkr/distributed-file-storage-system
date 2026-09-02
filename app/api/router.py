@@ -870,6 +870,9 @@ def create_upload_session(
     )
 
     idempotency_cache_key = None
+    idempotency_lock_key = None
+    lock_owner_token = None
+    lock_acquired = False
 
     if idempotency_key is not None:
         idempotency_key = idempotency_key.strip()
@@ -882,6 +885,9 @@ def create_upload_session(
 
         idempotency_cache_key = (
             f"upload:idempotency:{current_user.id}:{idempotency_key}"
+        )
+        idempotency_lock_key = (
+            f"upload:idempotency:lock:{current_user.id}:{idempotency_key}"
         )
 
         existing_session_id = redis_client.get(
@@ -904,44 +910,90 @@ def create_upload_session(
                     existing_session
                 )
 
-    file = File(
-        owner_id=current_user.id,
-        name=payload.filename.strip(),
-        mime_type=payload.mime_type,
-        size_bytes=0,
-        current_version_id=None,
-    )
+        lock_owner_token = secrets.token_urlsafe(32)
 
-    db.add(file)
-    db.flush()
-
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-
-    upload_session = UploadSession(
-        owner_id=current_user.id,
-        file_id=file.id,
-        filename=payload.filename.strip(),
-        mime_type=payload.mime_type,
-        total_size_bytes=payload.total_size_bytes,
-        chunk_size_bytes=chunk_size,
-        total_chunks=total_chunks,
-        received_chunks=0,
-        status="active",
-        expires_at=expires_at,
-    )
-
-    db.add(upload_session)
-    db.commit()
-    db.refresh(upload_session)
-
-    if idempotency_cache_key is not None:
-        redis_client.set(
-            idempotency_cache_key,
-            upload_session.id,
-            ttl_seconds=24 * 60 * 60,
+        lock_acquired = redis_client.set_if_not_exists(
+            idempotency_lock_key,
+            lock_owner_token,
+            ttl_seconds=30,
         )
 
-    return serialize_upload_session(upload_session)
+        if not lock_acquired:
+            existing_session_id = redis_client.get(
+                idempotency_cache_key
+            )
+
+            if existing_session_id is not None:
+                try:
+                    existing_session = db.scalar(
+                        select(UploadSession).where(
+                            UploadSession.id == int(existing_session_id),
+                            UploadSession.owner_id == current_user.id,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    existing_session = None
+
+                if existing_session is not None:
+                    return serialize_upload_session(
+                        existing_session
+                    )
+
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An upload with this Idempotency-Key is already being created.",
+            )
+
+    try:
+        file = File(
+            owner_id=current_user.id,
+            name=payload.filename.strip(),
+            mime_type=payload.mime_type,
+            size_bytes=0,
+            current_version_id=None,
+        )
+
+        db.add(file)
+        db.flush()
+
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+        upload_session = UploadSession(
+            owner_id=current_user.id,
+            file_id=file.id,
+            filename=payload.filename.strip(),
+            mime_type=payload.mime_type,
+            total_size_bytes=payload.total_size_bytes,
+            chunk_size_bytes=chunk_size,
+            total_chunks=total_chunks,
+            received_chunks=0,
+            status="active",
+            expires_at=expires_at,
+        )
+
+        db.add(upload_session)
+        db.commit()
+        db.refresh(upload_session)
+
+        if idempotency_cache_key is not None:
+            redis_client.set(
+                idempotency_cache_key,
+                upload_session.id,
+                ttl_seconds=24 * 60 * 60,
+            )
+
+        return serialize_upload_session(upload_session)
+
+    finally:
+        if (
+            lock_acquired
+            and idempotency_lock_key is not None
+            and lock_owner_token is not None
+        ):
+            redis_client.release_if_owner(
+                idempotency_lock_key,
+                lock_owner_token,
+            )
 
 
 @api_router.get(

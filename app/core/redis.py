@@ -29,10 +29,8 @@ class RedisClient:
     def get(self, key: str) -> Any | None:
         """Get a JSON-encoded value from Redis."""
         value = self._client.get(key)
-
         if value is None:
             return None
-
         return json.loads(value)
 
     def set(
@@ -65,6 +63,57 @@ class RedisClient:
                 ex=ttl_seconds,
             )
         )
+
+    def set_if_not_exists(
+        self,
+        key: str,
+        value: Any,
+        ttl_seconds: int,
+    ) -> bool:
+        """Set a JSON-encoded value only when the key does not exist."""
+        if ttl_seconds <= 0:
+            raise ValueError("TTL must be greater than zero.")
+
+        serialized_value = json.dumps(
+            value,
+            separators=(",", ":"),
+        )
+
+        return bool(
+            self._client.set(
+                key,
+                serialized_value,
+                ex=ttl_seconds,
+                nx=True,
+            )
+        )
+
+    def release_if_owner(
+        self,
+        key: str,
+        owner_token: str,
+    ) -> bool:
+        """Delete a lock only when its value matches the owner token."""
+        serialized_owner_token = json.dumps(
+            owner_token,
+            separators=(",", ":"),
+        )
+
+        script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        end
+        return 0
+        """
+
+        result = self._client.eval(
+            script,
+            1,
+            key,
+            serialized_owner_token,
+        )
+
+        return bool(result)
 
     def delete(self, key: str) -> int:
         """Delete a Redis key and return the number of keys removed."""
