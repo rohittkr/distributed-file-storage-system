@@ -36,7 +36,7 @@ from app.models.file import (
     StorageNode,
     UploadSession,
 )
-
+from app.services.replica_repair import get_healthy_chunk_replicas
 from app.models.share import Share
 
 from app.models.user import User
@@ -840,16 +840,10 @@ def download_file_content(
     content_parts: list[bytes] = []
 
     for chunk in chunks:
-        replicas = list(
-            db.scalars(
-                select(ChunkReplica)
-                .where(
-                    ChunkReplica.chunk_id == chunk.id,
-                    ChunkReplica.status == "healthy",
-                )
-                .order_by(ChunkReplica.id)
-            ).all()
-        )
+        replicas = get_healthy_chunk_replicas(
+        db,
+        chunk.id,
+    )
 
         if not replicas:
             raise HTTPException(
@@ -1412,20 +1406,14 @@ def complete_upload(
     for expected_number, chunk in enumerate(chunks):
         if chunk.chunk_number != expected_number:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Upload chunks are incomplete or out of order.",
-            )
-
-        replicas = list(
-            db.scalars(
-                select(ChunkReplica)
-                .where(
-                    ChunkReplica.chunk_id == chunk.id,
-                    ChunkReplica.status == "healthy",
-                )
-                .order_by(ChunkReplica.id)
-            ).all()
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Upload chunks are incomplete or out of order.",
         )
+
+        replicas = get_healthy_chunk_replicas(
+        db,
+        chunk.id,
+    )
 
         if not replicas:
             raise HTTPException(
@@ -1658,15 +1646,9 @@ def download_file_version_content(
     content_parts: list[bytes] = []
 
     for chunk in chunks:
-        replicas = list(
-            db.scalars(
-                select(ChunkReplica)
-                .where(
-                    ChunkReplica.chunk_id == chunk.id,
-                    ChunkReplica.status == "healthy",
-                )
-                .order_by(ChunkReplica.id)
-            ).all()
+        replicas = get_healthy_chunk_replicas(
+            db,
+            chunk.id
         )
 
         if not replicas:
@@ -1967,15 +1949,9 @@ def download_shared_file_content(
     content_parts: list[bytes] = []
 
     for chunk in chunks:
-        replicas = list(
-            db.scalars(
-                select(ChunkReplica)
-                .where(
-                    ChunkReplica.chunk_id == chunk.id,
-                    ChunkReplica.status == "healthy",
-                )
-                .order_by(ChunkReplica.id)
-            ).all()
+        replicas = get_healthy_chunk_replicas(
+            db,
+            chunk.id,
         )
 
         if not replicas:
