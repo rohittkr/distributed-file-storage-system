@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from uuid import uuid4
 
@@ -7,12 +8,14 @@ from app.db.session import SessionLocal
 from app.models.file import (
     Chunk,
     ChunkReplica,
+    ContentObject,
     File,
     FileVersion,
     StorageNode,
 )
 from app.models.user import User
 from app.services.content_deduplication import (
+    acquire_content_object,
     find_existing_chunk_by_content_hash,
     get_healthy_replicas_for_content,
     verify_content_hash,
@@ -105,6 +108,7 @@ def test_find_existing_chunk_by_content_hash():
             for chunk in matching_chunks
         )
 
+
 def test_find_existing_chunk_requires_matching_size():
     content = b"deduplicated content"
 
@@ -181,3 +185,64 @@ def test_get_healthy_replicas_for_content():
 
         assert len(result) == 1
         assert result[0].id == replica.id
+
+
+def test_concurrent_identical_content_creates_single_content_object():
+    content = f"concurrent-dedup-{uuid4().hex}".encode()
+    content_hash = sha256(content).hexdigest()
+    size_bytes = len(content)
+
+    def acquire():
+        with SessionLocal() as db:
+            result = acquire_content_object(
+                db,
+                content,
+            )
+            db.commit()
+
+            return result[0].id, result[1]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(acquire)
+            for _ in range(2)
+        ]
+
+        results = [
+            future.result()
+            for future in futures
+        ]
+
+    with SessionLocal() as db:
+        objects = list(
+            db.scalars(
+                select(ContentObject).where(
+                    ContentObject.content_hash == content_hash,
+                    ContentObject.size_bytes == size_bytes,
+                )
+            ).all()
+        )
+
+        assert len(objects) == 1
+
+        content_object = objects[0]
+
+        assert content_object.reference_count == 2
+
+        returned_ids = [
+            object_id
+            for object_id, _created in results
+        ]
+
+        assert returned_ids == [
+            content_object.id,
+            content_object.id,
+        ]
+
+        created_flags = [
+            created
+            for _object_id, created in results
+        ]
+
+        assert created_flags.count(True) == 1
+        assert created_flags.count(False) == 1
