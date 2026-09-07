@@ -17,35 +17,45 @@ from app.db.session import Base
 class File(Base):
     __tablename__ = "files"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     owner_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
     name: Mapped[str] = mapped_column(
         String(512),
         nullable=False,
     )
+
     mime_type: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
     )
+
     size_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=0,
     )
+
     current_version_id: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
     )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -91,26 +101,34 @@ class FileVersion(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     file_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("files.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
     version_number: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
     )
+
     size_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
     )
+
     checksum: Mapped[str] = mapped_column(
         String(64),
         index=True,
         nullable=False,
     )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -129,6 +147,61 @@ class FileVersion(Base):
     )
 
 
+class ContentObject(Base):
+    __tablename__ = "content_objects"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "content_hash",
+            "size_bytes",
+            name="uq_content_objects_hash_size",
+        ),
+        Index(
+            "ix_content_objects_content_hash",
+            "content_hash",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
+    content_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+
+    reference_count: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    chunks = relationship(
+        "Chunk",
+        back_populates="content_object",
+    )
+
+
 class Chunk(Base):
     __tablename__ = "chunks"
 
@@ -144,25 +217,43 @@ class Chunk(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     version_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("file_versions.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
+    content_object_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "content_objects.id",
+            ondelete="SET NULL",
+        ),
+        index=True,
+        nullable=True,
+    )
+
     chunk_number: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
     )
+
     size_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
     )
+
     checksum: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
     )
+
     content_hash: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
@@ -170,6 +261,11 @@ class Chunk(Base):
 
     version = relationship(
         "FileVersion",
+        back_populates="chunks",
+    )
+
+    content_object = relationship(
+        "ContentObject",
         back_populates="chunks",
     )
 
@@ -183,32 +279,41 @@ class Chunk(Base):
 class StorageNode(Base):
     __tablename__ = "storage_nodes"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     node_id: Mapped[str] = mapped_column(
         String(128),
         unique=True,
         index=True,
         nullable=False,
     )
+
     endpoint: Mapped[str] = mapped_column(
         String(512),
         nullable=False,
     )
+
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default="healthy",
     )
+
     capacity_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=0,
     )
+
     used_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=0,
     )
+
     last_heartbeat: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -236,37 +341,47 @@ class ChunkReplica(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     chunk_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("chunks.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
     storage_node_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("storage_nodes.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
     storage_key: Mapped[str] = mapped_column(
         String(1024),
         nullable=False,
     )
+
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default="healthy",
     )
+
     checksum: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
     )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -300,58 +415,73 @@ class UploadSession(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     owner_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("users.id", ondelete="CASCADE"),
         index=True,
         nullable=False,
     )
+
     file_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("files.id", ondelete="SET NULL"),
         index=True,
         nullable=True,
     )
+
     filename: Mapped[str] = mapped_column(
         String(512),
         nullable=False,
     )
+
     mime_type: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
     )
+
     total_size_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
     )
+
     chunk_size_bytes: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
     )
+
     total_chunks: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
     )
+
     received_chunks: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
     )
+
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default="active",
     )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
     )
+
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
