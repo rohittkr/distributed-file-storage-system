@@ -9,32 +9,47 @@ from app.db.session import Base
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+
     email: Mapped[str] = mapped_column(
         String(320),
         unique=True,
         index=True,
         nullable=False,
     )
+
     password_hash: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
     )
+
     quota_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=536870912,
     )
+
     used_bytes: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=0,
     )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=True,
     )
+
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

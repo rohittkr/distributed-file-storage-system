@@ -1,5 +1,3 @@
-from collections.abc import Generator
-
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
@@ -62,7 +60,22 @@ def get_current_user(
     return user
 
 
+def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Return the authenticated user when they have admin access."""
+
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required.",
+        )
+
+    return current_user
+
+
 CurrentUser = Depends(get_current_user)
+CurrentAdmin = Depends(get_current_admin)
 
 
 def require_file_owner(

@@ -18,7 +18,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import (
+    CurrentAdmin,
+    get_current_user,
+)
 from app.core.cache import (
     cache_file,
     get_cached_file,
@@ -37,6 +40,9 @@ from app.models.file import (
     UploadSession,
 )
 from app.services.replica_repair import get_healthy_chunk_replicas
+from app.services.replica_reconciliation import (
+    reconcile_under_replicated_chunks,
+)
 from app.models.share import Share
 
 from app.models.user import User
@@ -68,6 +74,15 @@ from app.storage.local import LocalStorageBackend
 
 
 api_router = APIRouter()
+@api_router.post(
+    "/admin/replicas/reconcile",
+)
+def reconcile_replicas(
+    current_admin=CurrentAdmin,
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    """Reconcile under-replicated chunks."""
+    return reconcile_under_replicated_chunks(db)
 
 
 def get_healthy_storage_nodes(

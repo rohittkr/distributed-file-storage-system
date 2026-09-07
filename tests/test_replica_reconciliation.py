@@ -17,6 +17,15 @@ from app.services.replica_reconciliation import (
     reconcile_under_replicated_chunks,
 )
 from app.storage.local import LocalStorageBackend
+from fastapi.testclient import TestClient
+
+from app.core.security import create_access_token
+from app.main import app
+from app.models.user import User
+
+
+
+client = TestClient(app)
 
 
 def create_test_user() -> int:
@@ -413,3 +422,57 @@ def test_reconcile_does_nothing_when_fully_replicated(
     assert result["checked"] >= 0
     assert result["repaired"] >= 0
     assert result["skipped"] >= 0
+def test_reconciliation_endpoint_requires_authentication():
+    response = client.post(
+        "/api/v1/admin/replicas/reconcile",
+    )
+
+    assert response.status_code == 401
+
+
+def test_reconciliation_endpoint_rejects_non_admin():
+    user_id = create_test_user()
+
+    token = create_access_token(
+        str(user_id),
+    )
+
+    response = client.post(
+        "/api/v1/admin/replicas/reconcile",
+        headers={
+            "Authorization": f"Bearer {token}",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_reconciliation_endpoint_allows_admin():
+    user_id = create_test_user()
+
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+
+        assert user is not None
+
+        user.is_admin = True
+        db.commit()
+
+    token = create_access_token(
+        str(user_id),
+    )
+
+    response = client.post(
+        "/api/v1/admin/replicas/reconcile",
+        headers={
+            "Authorization": f"Bearer {token}",
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert "checked" in body
+    assert "repaired" in body
+    assert "skipped" in body
